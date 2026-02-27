@@ -65,15 +65,15 @@ The real benchmark data has dates in **2020-2026**. The parser hardcodes years 2
 - **512KB read chunks with zero-copy are optimal.** The hot loop now processes $raw directly (no $leftover.$raw concatenation).
 - **json_encode is unnecessary for slug keys** — use escaped literal: `"\/blog\/" . $slug`
 - **The JSON output uses `\` escaped slashes** — `json_encode('/blog/slug')` produces `"\/blog\/slug"`. If you modify JSON output, ensure forward slashes are escaped with `\`.
-- **IPC uses socket_create_pair + socket_export_stream** — current architecture creates raw sockets via the `sockets` extension, sets SO_SNDBUF/SO_RCVBUF to 2MB via socket_set_option, then exports to PHP streams with socket_export_stream. If you modify IPC creation, use this pattern (NOT stream_socket_pair which has 8KB default buffers).
-- **Socket fd cleanup is critical** — children must close all parent socket ends and sibling child socket ends to avoid fd leaks and ensure proper EOF detection. fclose() works on exported streams.
-- **SOCKET BUFFER LIMIT**: With 2MB buffers set via socket_set_option, workers can write up to ~2MB without blocking. At 100M scale, parsing workers send ~20MB each, so sequential stream_get_contents handles this via blocking reads.
-- **Drain uses sequential stream_get_contents + inline merge (iter9)** — NOT stream_select. Sequential blocking reads are faster at 10M (14.6ms → ~8ms) because stream_select has per-iteration PHP overhead and O(n²) string concatenation. stream_get_contents uses C-level internal buffering. NEVER reintroduce stream_select for the drain loop.
+- **Parsing workers use TEMP FILE IPC (iter15)** — workers write TLV-encoded output to temp files via `file_put_contents($tmpDir . '/parser_w' . $w, $out)`. Parent reads with `file_get_contents()` after `waitpid(-1)`. NEVER use sockets for parsing workers in coordinator pattern — 2MB socket buffer causes deadlock at 100M (workers block on fwrite, parent blocks on waitpid).
+- **Parent is a COORDINATOR (iter15)** — parent forks ALL workers as children, does NO hotloop work itself. Uses `waitpid(-1)` to drain workers in completion order (fastest first). `$pidToWorker[$pid]` maps PIDs to worker indices.
+- **Counting workers still use socket_create_pair + socket_export_stream** — counting worker output is small (~4MB total). Sockets work fine for counting.
+- **Socket fd cleanup is critical for counting workers** — children must close all parent socket ends and sibling child socket ends to avoid fd leaks. fclose() works on exported streams.
 - **Do NOT reduce counting workers below 8** — tested 4 workers in iter9, +6.5% regression. The serial bottleneck (slowest worker) dominates.
 - **Work stealing with flock is SLOWER on M4 Pro** (+4.6%).
 - **Socket buffer size already tuned to 2MB** via socket_set_option. kern.ipc.maxsockbuf is 8MB.
 - **8x loop unrolling is NOT measurably better than 6x.**
-- **The parser now has TWO fork phases:** (1) 10 parsing workers, (2) **8** counting+JSON workers. When modifying, understand both phases.
+- **The parser now has TWO fork phases:** (1) N parsing workers (all children, parent coordinates), (2) **10** counting+JSON workers. When modifying, understand both phases.
 - **The counting workers receive merged data via COW fork** — they read $mergedBuckets via key-based access. Each worker processes a range of slugs and sends JSON fragments via pipe.
 - **Child workers use posix_kill(SIGKILL) for fast exit** — skips PHP shutdown overhead (~17ms saved). Place AFTER fclose($sock) to ensure data is flushed.
 - **JSON generation MUST be parallel** — single-threaded JSON for 270 slugs × 3000+ dates takes ~90ms. With 8 parallel workers it's ~22ms. NEVER move JSON generation to a single thread.
