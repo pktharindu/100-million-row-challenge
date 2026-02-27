@@ -70,7 +70,9 @@ data/test-data-expected.json
 
 ## Iteration Protocol
 
-Each Ralph iteration follows this flow. You have significant freedom in HOW you execute each phase, but the ordering is strict.
+**You are ONE iteration.** Ralph invokes you, you execute Phases 1–10 exactly once, then you stop. The Ralph loop handles re-invocation — you do NOT loop internally. One invocation = one pass through the phases = one batch of experiments benchmarked = done.
+
+You have significant freedom in HOW you execute each phase, but the ordering is strict.
 
 ### Phase 1: Orient
 
@@ -274,9 +276,11 @@ After every iteration, briefly evaluate your own process and improve it for the 
 
 **Budget:** Spend no more than ~2 minutes on self-improvement per iteration. This is a sharpening-the-saw step, not the main work. Make targeted edits, not rewrites.
 
-### Phase 10: Continue or Signal
+### Phase 10: Stop
 
-**Normal completion:** No tag needed — the loop continues automatically to the next iteration.
+**After completing Phase 9, you are DONE. Stop here.** Do not loop back to Phase 1. Ralph will invoke a fresh instance for the next iteration.
+
+**Normal completion:** No tag needed — just stop. Ralph continues the loop automatically.
 
 **All viable optimizations exhausted:**
 ```
