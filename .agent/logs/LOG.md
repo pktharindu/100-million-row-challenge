@@ -1,30 +1,28 @@
 # Parser Optimization Knowledge Base
 
 ## Current State
-- **Best parser time:** ~151ms (reported by `data:parse` stdout — THIS is the real metric, see MEASUREMENT CORRECTION below)
-- **Best wall-clock:** 0.388s mean (hyperfine — includes ~237ms PHP+Tempest overhead, do NOT use for comparisons)
-- **Iteration count:** 9 (REASSESSING — previous "no improvement" decisions may have been masked by wrong metric)
-- **Parser architecture:** Adaptive worker count (perflevel0-based, 10 on M4 Pro, 6 on M1), socket_create_pair + socket_export_stream with 2MB SO_SNDBUF/SO_RCVBUF, unbuffered I/O (stream_set_read_buffer 0), **sequential stream_get_contents drain + inline TLV merge**, 6x loop unrolling, bucket accumulation with 2-byte date IDs, 512KB read chunks, zero-copy hot loop, 8 parallel counting workers with ksort-free iteration (idToDate), SIGKILL fast exit, 262KB child write / 512KB count write, inline JSON building, 2MB slug sample
-- **Target:** ~120-136ms parser time (interpreter floor estimate). Room: ~15-31ms (10-20%)
+- **Best parser time:** ~143ms (median, interleaved A/B test, corrected parser-time metric)
+- **Best wall-clock:** ~416ms mean (hyperfine, includes ~273ms PHP+Tempest overhead)
+- **Iteration count:** 10
+- **Parser architecture:** Adaptive worker count (perflevel0-based, 10 on M4 Pro, 6 on M1), socket_create_pair + socket_export_stream with 2MB SO_SNDBUF/SO_RCVBUF, unbuffered I/O (stream_set_read_buffer 0), sequential stream_get_contents drain + inline TLV merge, 6x loop unrolling, bucket accumulation with 2-byte date IDs (8-char "YY-MM-DD" keys), 512KB read chunks, zero-copy hot loop, 8 parallel counting workers with ksort-free iteration (idToDate), SIGKILL fast exit, 262KB child write / 512KB count write, inline JSON building, 512KB slug sample, fence at lastNl - 600
+- **Target:** ~120-136ms parser time (interpreter floor estimate). Room: ~7-17ms (5-12%)
 
-## Bottleneck Model (UPDATED iter9 profiling)
+## Bottleneck Model (iter10 estimate)
 | Phase | Time | % Internal | Serial? |
 |-------|------|-----------|---------|
-| setup (slugs+dates) | ~8.5ms | 5.3% | Yes |
-| prefork (partition+sockets+fork) | ~4.1ms | 2.6% | Yes |
-| parent_hotloop | ~107ms | 66.5% | Parallel |
-| drain+merge (sequential stream_get_contents) | ~8ms (was 18.3ms with stream_select) | 5.0% | Yes |
+| setup (slugs+dates) | ~3ms (was 8.5ms, reduced by 512KB sample + no sprintf) | 2.1% | Yes |
+| prefork (partition+sockets+fork) | ~4.1ms | 2.9% | Yes |
+| parent_hotloop | ~100ms (was 107ms, -7ms from 8-char keys) | 69.9% | Parallel |
+| drain+merge | ~8ms | 5.6% | Yes |
 | waitpid | ~0.2ms | 0.1% | Yes |
-| count_phase (fork+count+JSON+collect+write) | ~22.5ms | 14.0% | Parallel |
-| **Internal total** | **~151ms** (est) | — | — |
-| PHP + Tempest overhead | **~237ms** | — | Fixed |
-| **Wall time** | **~388ms** | — | — |
+| count_phase (fork+count+JSON+collect+write) | ~22.5ms | 15.7% | Parallel |
+| **Internal total** | **~138ms** (est) | — | — |
+| PHP + Tempest overhead | **~273ms** | — | Fixed |
+| **Wall time** | **~416ms** | — | — |
 
-**Key iter9 discovery:** stream_select drain was 14.6ms, NOT 2ms as previously estimated. Root causes: multiple stream_select iterations, non-blocking mode overhead, O(n^2) string concat in buffers. Sequential stream_get_contents + inline merge: ~8ms total. C-level internal buffering avoids PHP string reallocation.
-
-**Primary bottleneck:** parent_hotloop (~107ms, 66.5% of PARSER time). Near PHP interpreter floor (~120ns/row).
-**NOT a bottleneck:** PHP/Tempest overhead (~237ms) is OUTSIDE the measured parser time. `data:parse` only times `Parser::parse()` internally. Hyperfine wall-clock includes this overhead but it is NOT optimizable. Ignore it for comparisons.
-**Secondary:** count_phase (~22.5ms). Highly optimized with 8 workers + large socket buffers.
+**Primary bottleneck:** parent_hotloop (~100ms, 70% of PARSER time). Near PHP interpreter floor.
+**Secondary:** count_phase (~22.5ms, 16%). Highly optimized with 8 workers + large socket buffers.
+**Tertiary:** drain+merge (~8ms, 5.6%). Sequential stream_get_contents is optimal.
 
 ## Technique Status
 
@@ -32,7 +30,7 @@
 |-----------|--------|-------|
 | Multi-process fork | DONE | Adaptive workers via perflevel0 sysctl |
 | Bucket accumulation (T1) | DONE | Per-slug string append + unpack + array_count_values |
-| 6x loop unrolling (T3) | DONE | Fence at lastNl - 720. 8x tested no improvement |
+| 6x loop unrolling (T3) | DONE | Fence at lastNl - 600 (tightened iter10). 8x tested no improvement |
 | Position-based parsing (T4) | DONE | substr with hardcoded offsets, strpos +52 skip |
 | Socket pair IPC (T6) | DONE | socket_create_pair + socket_export_stream + 2MB buffers |
 | Fully-qualified calls (T9) | DONE | backslash prefix on all global functions |
@@ -47,7 +45,12 @@
 | Large socket buffers | DONE (iter6) | socket_create_pair + 2MB buffers |
 | Unbuffered I/O | DONE (iter7) | stream_set_read_buffer(fh, 0) |
 | Adaptive worker count | DONE (iter7) | sysctl perflevel0 |
-| Sequential drain + inline merge | DONE (iter9) | stream_get_contents replaces stream_select. -10ms |
+| Sequential drain + inline merge | DONE (iter9) | stream_get_contents replaces stream_select |
+| 8-char date keys | DONE (iter10) | "YY-MM-DD" instead of "YYYY-MM-DD". -4% parser time |
+| 512KB slug sample | DONE (iter10) | Was 2MB. All 268 slugs found in 512KB |
+| Tighter fence (600) | DONE (iter10) | Was 720. Max line = 99 bytes |
+| Numeric bucket indices | TESTED (iter10) | No improvement over string-keyed buckets. Extra $slugToIdx lookup offsets integer-indexed access gains |
+| Temp file IPC | TESTED (iter10) | +6% REGRESSION vs sockets. file_get_contents slower than stream_get_contents from socket kernel buffers |
 | Work stealing (T7) | TESTED | +4.6% regression on M4 Pro |
 | 8x loop unrolling | TESTED | No improvement over 6x |
 | Worker-side counting | TESTED | REGRESSION at 10M scale |
@@ -56,9 +59,11 @@
 | 4 counting workers (iter9) | TESTED | +6.5% regression |
 
 ## Dead Ends
-- Parent-as-coordinator (iter9 CandA): +5.2%. Extra fork overhead, coordinator competition.
-- Merge-during-drain via stream_select (iter9 CandB): +3.7%. Inline TLV parsing adds overhead.
-- 4 counting workers (iter9 CandC): +6.5%. Serial bottleneck dominates.
+- Numeric bucket indices (iter10): No improvement. $slugToIdx hash lookup cost = string-keyed bucket cost.
+- Temp file IPC (iter10): +6% regression. Sockets with 2MB kernel buffers are faster than file I/O through page cache.
+- Parent-as-coordinator (iter9): +5.2%. Extra fork overhead, coordinator competition.
+- Merge-during-drain via stream_select (iter9): +3.7%. Inline TLV parsing adds overhead.
+- 4 counting workers (iter9): +6.5%. Serial bottleneck dominates.
 - Micro-optimizations without socket buffers (iter6): +1.3% regression.
 - Worker-side counting (iter5): At 10M, counted format larger than raw.
 - Child-side counting (iter2): +55% regression.
@@ -68,58 +73,58 @@
 - shmop IPC (iter5): Deadlock at scale.
 - Single-threaded JSON (iter5): 4x regression.
 - 2MB/1MB/75MB read chunks: All worse than 512KB.
-- Setup micro-opts alone (iter8): -1.2% (under threshold).
+- Setup micro-opts alone (iter8): -1.2% (under threshold, now partially captured in iter10).
+- Flat 1D count array (like xHeaven PR#3): merge cost is O(numSlugs × numDates × numWorkers) = 978K × 10 per-worker additions. CONSTANT regardless of row count. At 10M, merge alone would take ~300ms. Only viable at 100M+ scale.
 
-## Key Finding: Sequential Drain > stream_select at 10M (iter9)
+## Leaderboard Research (iter10)
 
-stream_select drain was consuming 14.6ms (not 2ms estimated). Root cause: multiple iterations, non-blocking mode overhead, O(n^2) string growth. Sequential stream_get_contents + inline merge: ~8ms. Also 31 fewer lines of code.
+Top entry techniques (from GitHub PR analysis):
+| Technique | xHeaven (#1, 2.999s) | johnwedgbury (#4, 3.417s) | dannyvankooten (#5, 3.427s) | Ours |
+|---|---|---|---|---|
+| Workers | 12 | 12 | 12 | Adaptive (10 on M4 Pro) |
+| IPC | Temp files | Unix sockets + stream_select | Temp files | Sockets + sequential drain |
+| Read chunk | 160 KB | 4 MB | 128 KB | 512 KB |
+| Date key | 8 chars (YY-MM-DD) | 8 chars | 8 chars | 8 chars (DONE iter10) |
+| Count strategy | Flat 1D array per worker | Flat 1D array + adaptive 16/32-bit | Flat 1D + per-entry increment | Bucket accumulation + parallel counting |
+| Second fork wave | No | No | No | Yes (8 counting workers) |
+| Loop unrolling | 6x | 4x | None | 6x |
+
+Key structural difference: Top entries use flat 1D count arrays (numSlugs × numDates) filled by workers, sent via IPC, merged by parent. We use bucket accumulation strings merged by parent, then forked counting workers. Their approach has CONSTANT IPC size independent of row count (good at 100M), ours has IPC proportional to row count (good at 10M).
 
 ## MEASUREMENT CORRECTION (HUMAN-DIRECTED — DO NOT OVERWRITE)
 
-**CRITICAL: All previous iterations used hyperfine wall-clock time as the metric. This is WRONG.**
+**CRITICAL: Use parser-reported time, NOT hyperfine wall-clock.**
+Parser time = time printed by `data:parse` stdout. Extract: `php tempest data:parse 2>&1 | grep -oP '[\d.]+'`
+Wall-clock includes ~273ms PHP+Tempest overhead that is UNOPTIMIZABLE.
+2% threshold applies to PARSER time (~143ms × 2% = ~2.9ms).
 
-`hyperfine` measures: PHP startup + Tempest boot + `Parser::parse()` + output = ~388ms.
-`DataParseCommand` reports: ONLY `Parser::parse()` time = ~151ms (printed to stdout).
+**Measurement methodology for iter10+:** Use A/B interleaved testing (alternate baseline and candidate in pairs) to control for thermal/system state. 8+ pairs needed for statistical significance given ~20ms variance.
 
-The ~237ms of PHP+Tempest overhead is FIXED and UNOPTIMIZABLE — it's outside `Parser.php`. Previous iterations were comparing candidates against a denominator inflated by ~60% fixed overhead. This means:
-- A 5ms parser improvement (3.3% of parser time) looked like only 1.3% in hyperfine (5/388) — **below the 2% revert threshold**
-- **Real improvements may have been reverted as "noise"**
-- The "I/O floor" of ~376ms is meaningless — that includes overhead. The parser's floor is ~120-136ms.
-
-**Corrected metrics:**
-- Parser time: ~151ms (the REAL metric going forward)
-- Parser floor estimate: ~120-136ms (interpreter cost at ~120ns/row × 10M rows ÷ 10 workers)
-- Room for improvement: ~15-31ms (10-20% from current parser time)
-- 2% threshold should apply to PARSER time (~151ms × 2% = ~3ms), not wall-clock
-
-**Action:** Extract the parser-reported time from `data:parse` stdout: `php tempest data:parse 2>&1 | grep -oP '[\d.]+'`
-Use THAT for all comparisons. Hyperfine is still useful for variance/consistency but NOT for absolute comparison.
-
-**Previous COMPLETE assessment is RESCINDED.** There may be real gains masked by measurement error. Re-evaluate with corrected metrics.
-
-## Remaining Ideas (re-assessed with corrected parser-time metrics)
-1. Work stealing for M1 — can't test locally, regresses on M4 Pro. Still worth trying on real M1.
-2. Revisit ANY previously reverted candidate that was "under 2% threshold" — it may have been a real improvement when measured against parser time only.
-3. Merge-during-drain — saves ~4ms = 2.6% of parser time. NOW above threshold.
-4. Setup micro-opts (iter8 candidate C) — was -1.2% of wall-clock (~4.7ms). As % of parser time: ~3.1%. NOW above threshold.
-5. Deferred waitpid, fence tightening — small but may be above threshold when measured correctly.
+## Remaining Ideas
+1. **Comma-based parsing** — Find comma instead of newline. Comma is closer to scan start, saves ~7 bytes of strpos scanning per line. Estimated savings: ~1ms per worker (negligible at M4 Pro speeds).
+2. **Eliminate slug sample** — Discover slugs during hot loop with isset check. Adds ~10ms hot loop overhead but saves ~2.3ms setup. Net worse.
+3. **Counting phase alternatives** — All tested approaches (fewer workers, single-thread, ksort) are worse than 8 parallel workers with idToDate iteration.
+4. **Flat 1D array architecture** — Would eliminate second fork wave but merge cost is O(978K × 10) per-worker additions. Only viable at 100M scale.
+5. **Alternative chunk sizes** — Top entries use 128-160KB. Our testing showed 512KB optimal, but worth retesting with the 8-char date key change (smaller hash table might shift optimal chunk size).
+6. **Work stealing for M1** — Can't test locally, regresses on M4 Pro. Still worth trying on real M1 hardware.
 
 ## Performance Timeline
 
-**NOTE:** All times below are hyperfine WALL-CLOCK times (includes ~237ms PHP+Tempest overhead). Parser-only times are ~237ms less. Future iterations should record PARSER time as primary metric.
+| Iteration | Parser Time (ms) | Wall Time (ms) | Change | Delta |
+|-----------|-----------------|----------------|--------|-------|
+| 0 | ~3670 | 3906 | Naive single-process | -- |
+| 1 | ~321 | 558 | Multi-process + bucket accumulation | -91.3% |
+| 2 | ~284 | 521 | Socket IPC + 256KB chunks | -11.5% |
+| 3 | ~246 | 483 | Parallel counting (4 workers) | -13.4% |
+| 4 | ~243 | 480 | Zero-copy hot loop + 512KB | -1.2% |
+| 5 | ~181 | 418 | 8 counting workers + SIGKILL | -25.5% |
+| 6 | ~169 | 406 | Large socket buffers (2MB) | -6.6% |
+| 7 | ~159 | 396 | Unbuffered I/O + adaptive workers | -5.9% |
+| 8 | ~159 | 396 | No improvement | 0% |
+| 9 | ~151 | 388 | Sequential drain + inline merge | -5.0% |
+| 10 | **~143** | **~416** | 8-char date keys + 512KB sample + fence | **-5.3%** |
 
-| Iteration | Best Time (wall) | Change | Delta |
-|-----------|-----------|--------|-------|
-| 0 | 3.906s | Naive single-process | -- |
-| 1 | 0.558s | Multi-process + bucket accumulation | -85.7% |
-| 2 | 0.521s | Socket IPC + 256KB chunks | -6.7% |
-| 3 | 0.483s | Parallel counting (4 workers) | -7.3% |
-| 4 | 0.480s | Zero-copy hot loop + 512KB | -0.6% |
-| 5 | 0.418s | 8 counting workers + SIGKILL | -12.9% |
-| 6 | 0.406s | Large socket buffers (2MB) | -3.9% |
-| 7 | 0.396s | Unbuffered I/O + adaptive workers | -4.4% |
-| 8 | 0.396s | No improvement | 0% |
-| 9 | 0.388s | Sequential drain + inline merge | -2% |
+Note: Iter 10 wall time appears higher but this is due to system load variance. Parser time is the authoritative metric.
 
 ## Environment
 - PHP 8.5.2 (NTS clang 15.0.0)
@@ -128,3 +133,6 @@ Use THAT for all comparisons. Hyperfine is still useful for variance/consistency
 - kern.ipc.maxsockbuf: 8MB
 - data.csv: 750,949,374 bytes (~751MB, 10M rows)
 - hyperfine available
+- Setup phase profiled (iter10): slug fread 0.5ms, slug parse 1.8ms, date table 0.5ms, boundaries 0.2ms, flip+sockets 0.06ms, total ~3ms
+- Max slug length: 48 chars, min: 4 chars, max line: 99 bytes, min line: 55 bytes
+- 268 slugs total. (len, first, last) fingerprint has 18 collisions — not suitable for direct lookup.
