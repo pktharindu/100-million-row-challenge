@@ -193,6 +193,7 @@ final class Parser
                     $written += $n;
                 }
                 \fclose($sock);
+                \posix_kill(\posix_getpid(), 9); // fast exit: skip PHP shutdown
                 exit(0);
             }
             $childPids[] = $pid;
@@ -258,7 +259,7 @@ final class Parser
         }
 
         // Parallel batch count + JSON output using forked counting workers
-        $numCounters = 4;
+        $numCounters = 8;
         $numSlugs = \count($slugOrderList);
         $slugsPerCounter = (int)\ceil($numSlugs / $numCounters);
 
@@ -309,6 +310,7 @@ final class Parser
                     $written += $n;
                 }
                 \fclose($sock);
+                \posix_kill(\posix_getpid(), 9); // fast exit: skip PHP shutdown
                 exit(0);
             }
             $countPids[] = $pid;
