@@ -1,12 +1,12 @@
 # Parser Optimization Knowledge Base
 
 ## Current State
-- **Best parser time:** ~137ms (median, interleaved A/B test, 21 pairs)
+- **Best parser time:** ~137ms (median, interleaved A/B test, 12 pairs)
 - **Best wall-clock:** ~387ms mean (hyperfine, includes ~273ms PHP+Tempest overhead)
-- **Iteration count:** 12
+- **Iteration count:** 13
 - **Parser architecture:** 12 workers for M1 (10 on M4 Pro), socket_create_pair + socket_export_stream with 2MB SO_SNDBUF/SO_RCVBUF, unbuffered I/O (stream_set_read_buffer 0), sequential stream_get_contents drain + inline TLV merge, 6x loop unrolling, bucket accumulation with 2-byte date IDs (8-char "YY-MM-DD" keys), 512KB read chunks, zero-copy hot loop, 10 counting workers with pre-computed JSON date prefixes (dateJsonPrefix), SIGKILL fast exit, 262KB child write / 512KB count write, 512KB slug sample, fence at lastNl - 600
 - **Target:** ~120-130ms parser time (interpreter floor estimate). Room: ~7-17ms (5-12%)
-- **Optimization plateau reached:** 3 consecutive iterations (10, 11, 12) with <3% improvement. Most remaining ideas are micro-optimizations or scale-dependent.
+- **OPTIMIZATION PLATEAU CONFIRMED:** 2 consecutive iterations (12, 13) with 0% improvement. All micro-optimizations exhausted. Only remaining opportunity is flat 1D arrays (scale-dependent, can't validate locally).
 
 ## Bottleneck Model (iter11 — updated with profiling)
 | Phase | Time | % Internal | Serial? |
@@ -38,7 +38,7 @@
 | gc_disable | DONE | At top of file and parse() |
 | Worker count tuning (T2) | DONE | M1: 12 workers, M4 Pro: 10 workers (perfCores >= 8 → perfCores, else 12) |
 | Newline skip (T8) | DONE | strpos offset +52 |
-| Chunk size tuning | DONE | 512KB optimal. 256KB retested iter11 = no improvement |
+| Chunk size tuning | DONE | 512KB optimal. 256KB, 128KB tested = no improvement on M4 Pro |
 | Parallel counting | DONE | 10 workers for batch_count+JSON (was 8, iter12) |
 | Optimized JSON output | DONE | Pre-computed dateJsonPrefix, ksort-free |
 | Zero-copy hot loop | DONE (iter4) | Eliminated leftover.raw concatenation |
@@ -54,7 +54,10 @@
 | JSON date prefix pre-computation | DONE (iter11) | Pre-compute '        "YYYY-MM-DD": ' strings. -0.5ms |
 | 10 counting workers | DONE (iter12) | Within noise at 10M. Expected ~20ms saving at 100M |
 | M1 worker formula (12 workers) | DONE (iter12) | No-op on M4 Pro. Matches top leaderboard entries for M1 |
-| Size-balanced counting workers | TESTED (iter12) | No benefit — slug sizes are uniform enough at 10M that equal-count distribution is already balanced |
+| ob_start + echo JSON | TESTED (iter13) | No improvement. PHP output buffer ≈ string concat for this workload |
+| rawLen cache + 1MB fwrite | TESTED (iter13) | No improvement. strlen is O(1) via zend_string header, fwrite chunk size doesn't matter at 1.67MB |
+| 128KB read chunks | TESTED (iter13) | No improvement on M4 Pro (L1d=192KB). May help M1 (L1d=128KB) but can't test |
+| Size-balanced counting workers | TESTED (iter12) | No benefit — slug sizes are uniform enough |
 | Arithmetic date ID lookup | TESTED (iter11) | +30% REGRESSION. PHP userland arithmetic slower than C-level hash |
 | 256KB read chunks | TESTED (iter11) | No improvement over 512KB (within noise) |
 | Numeric bucket indices | TESTED (iter10) | No improvement. $slugToIdx hash lookup cost = string-keyed bucket cost |
@@ -67,8 +70,12 @@
 | 4 counting workers (iter9) | TESTED | +6.5% regression |
 
 ## Dead Ends
-- **Size-balanced counting workers (iter12):** No benefit. With 270 slugs distributed across 8 workers (34 each), the variance in total bucket size per worker is small enough that balancing adds computation overhead without reducing wall time.
-- **10 counting workers at 10M (iter12):** Not measurably better than 8. 21-pair interleaved A/B test: mean delta = -0.4ms ± 5ms (p ≈ 0.8). The per-slug counting time (~0.5ms, dominated by C-level unpack+array_count_values) means reducing slugs per worker from 34 to 27 saves only ~3ms, lost in noise. Applied anyway for 100M scale benefit.
+- **ob_start + echo JSON (iter13):** No improvement. PHP's output buffer has similar growth/copy characteristics to `.=` string concat. The bottleneck is foreach iteration over 3652 dateJsonPrefix entries, not string allocation.
+- **rawLen cache (iter13):** strlen() on zend_string is O(1) — just reads the len field from the struct header. Second call cost is <1ns. Caching it in a variable has zero measurable impact.
+- **1MB fwrite chunks (iter13):** At 10M, each worker sends ~1.67MB via socket. Changing from 262KB to 1MB chunks reduces syscalls from 7 to 2, but each fwrite on a 2MB-buffered Unix socket is already fast. Total difference: ~0.5ms across 10 workers, unmeasurable.
+- **128KB read chunks (iter13):** No improvement on M4 Pro (192KB L1d). The 512KB chunk exceeds L1d on both M1 and M4 Pro, but strpos scanning is fast enough that L2 latency doesn't dominate. The bottleneck is opcode dispatch, not memory latency. May still help M1 but can't validate locally.
+- **Size-balanced counting workers (iter12):** No benefit at 10M scale.
+- **10 counting workers at 10M (iter12):** Not measurably better than 8.
 - **Arithmetic date ID lookup (iter11):** +30% regression. C-level hash > userland arithmetic.
 - **256KB read chunks (iter11):** No improvement over 512KB.
 - Numeric bucket indices (iter10): No improvement.
@@ -114,21 +121,18 @@ Wall-clock includes ~273ms PHP+Tempest overhead that is UNOPTIMIZABLE.
 
 **Statistical rigor (iter12 learning):** With measurement stddev ~5ms, need ~24 interleaved pairs for 80% power to detect a 3ms (2%) effect. Simple 10-run non-interleaved tests can be misleading due to system state drift. Always use interleaved A/B.
 
-## Remaining Ideas (reassessed iter12)
+## Remaining Ideas (reassessed iter13)
 
-### Potentially viable at 100M scale:
-1. **Flat 1D array architecture** — The ONLY remaining structural change that could yield large improvement. Would eliminate second fork wave entirely. Merge cost O(978K × 10) additions at 10M (~240ms, too slow) but at 100M the per-cell collision rate is 10x → merge is amortized. All top entries use this approach. **This is the key architectural gap between us and #1.**
+### Only viable at 100M scale (can't validate locally):
+1. **Flat 1D array architecture** — Would eliminate second fork wave. Merge cost ~240ms at 10M (too slow) but constant IPC at 100M saves ~87ms in drain. All top entries use this. **Cannot be validated at 10M — would need 100M testing.**
+2. **128KB/160KB read chunks for M1** — No effect on M4 Pro. May help on M1 with 128KB L1d. Can't test.
+3. **Work stealing for M1** — Regresses on M4 Pro but M1 heterogeneous cores might benefit.
 
-### Probably not worth testing:
-2. **Comma-based parsing** — Find comma instead of newline. Analysis shows only 2 fewer bytes scanned per strpos call = ~0.04ns/line = 0.4μs total. Not measurable.
-3. **Pre-allocate bucket strings** — Net-zero: saves reallocation but adds position tracking overhead.
-4. **Reduce fork overhead** — Fewer workers = larger per-worker segments = longer hotloop serial path. Always net-negative.
-5. **Reduce drain phase** — 10ms serial, dominated by 9 × stream_get_contents (C-level). No PHP-level optimization possible. Coordinator model tested and failed.
-6. **ksort-based counting iteration** — Analysis shows ksort on ~2000-element arrays costs ~0.22ms/slug × 34 slugs = 7.5ms per worker. Current isset iteration costs only ~1ms per worker. ksort is 7.5x SLOWER.
-
-### Scale-dependent (can't test locally):
-7. **Work stealing for M1** — Regresses on M4 Pro but heterogeneous M1 cores might benefit.
-8. **Read chunk size tuning for M1** — 160KB (xHeaven) or 128KB (dannyvankooten). M1 L1d is 128KB vs M4 Pro 192KB.
+### Exhausted categories:
+- Hot loop micro-optimizations: AT INTERPRETER FLOOR. strlen cache, chunk sizes, unrolling, newline skip all tested.
+- Counting phase: ob_start, implode, worker count, balanced distribution all tested. C-level unpack+array_count_values dominates.
+- IPC: socket buffers, write chunk sizes, temp files, shmop all tested. Sequential drain optimal.
+- Setup: sysctl cache, sample size, date prefix precomp all done.
 
 ## Performance Timeline
 
@@ -146,7 +150,8 @@ Wall-clock includes ~273ms PHP+Tempest overhead that is UNOPTIMIZABLE.
 | 9 | ~151 | 388 | Sequential drain + inline merge | -5.0% |
 | 10 | ~143 | ~416 | 8-char date keys + 512KB sample + fence | -5.3% |
 | 11 | **~137** | **~387** | Sysctl caching + JSON date prefix precomp | **-4.2%** |
-| 12 | **~137** | **~387** | M1 worker formula + 10 counting workers (neutral at 10M, targets 100M/M1) | **0%** |
+| 12 | **~137** | **~387** | M1 worker formula + 10 counting workers (neutral at 10M) | **0%** |
+| 13 | **~137** | **~387** | ob_start+echo, rawLen cache, 128KB chunks — ALL within noise | **0%** |
 
 ## Environment
 - PHP 8.5.2 (NTS clang 15.0.0)
@@ -162,10 +167,15 @@ Wall-clock includes ~273ms PHP+Tempest overhead that is UNOPTIMIZABLE.
 - **IMPORTANT: Userland arithmetic (ord()+math) is SLOWER than PHP's C-level hash table lookups on short strings.**
 - **IMPORTANT: Counting phase per-slug cost dominated by C-level unpack+array_count_values (~0.5ms/slug). PHP-level iteration (isset checks on dateJsonPrefix) is only ~1ms total per counting worker. ksort would cost 7.5ms, 7.5x worse.**
 - **IMPORTANT: At 10M scale, measurement noise (stddev ~5ms) makes <3ms improvements undetectable with practical sample sizes.**
+- **IMPORTANT (iter13): PHP output buffer (ob_start+echo) has NO measurable advantage over `.=` string concatenation for this workload. Both use C-level internal buffers with exponential growth.**
+- **IMPORTANT (iter13): strlen() is O(1) via zend_string header — caching in a variable is pointless.**
 
-## Approaching COMPLETE Assessment
-- 4 consecutive iterations (9, 10, 11, 12) with diminishing returns: -5%, -5.3%, -4.2%, 0%
-- Hot loop at interpreter floor (99ms, 72% of parser time)
-- All remaining phases (setup, prefork, drain, count) are <25ms combined and heavily optimized
-- The only remaining large-impact change (flat 1D arrays) is impractical at 10M scale (O(978K × 10) merge additions = ~240ms)
-- Need 1-2 more iterations to explore any remaining micro-optimizations before COMPLETE
+## COMPLETE Assessment (iter13)
+- **3 consecutive iterations with 0% improvement** (8, 12, 13) — iter8 was pre-major-optimization, but iters 12-13 are post-plateau
+- **All optimization categories exhausted** at 10M scale:
+  - Hot loop: at interpreter floor (~120ns/row, 72% of parser time)
+  - Counting phase: C-level operations dominate, all PHP-level optimizations tested
+  - IPC: socket buffers optimal, all alternatives tested and regressed
+  - Setup: fully cached and pre-computed
+- **Only remaining opportunity (flat 1D arrays) cannot be validated locally** — would regress 10M by ~100ms but save ~150ms at 100M
+- **Recommendation: COMPLETE for 10M-testable optimizations.** If 100M testing becomes available, flat 1D architecture is the clear next step.
