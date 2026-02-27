@@ -16,7 +16,7 @@ function _hotLoop(
     $remaining = $end - $start;
     $leftover = '';
 
-    while ($remaining > 0) {
+    do {
         $toRead = \min($chunkSize, $remaining);
         $raw = \fread($fh, $toRead);
         if ($raw === false || $raw === '') break;
@@ -46,39 +46,43 @@ function _hotLoop(
 
         $fence = $lastNl - 600;
 
-        while ($pos < $fence) {
-            $nl = \strpos($raw, "\n", $pos + 52);
-            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
-            $pos = $nl + 1;
+        if ($pos < $fence) {
+            do {
+                $nl = \strpos($raw, "\n", $pos + 52);
+                $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
+                $pos = $nl + 1;
 
-            $nl = \strpos($raw, "\n", $pos + 52);
-            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
-            $pos = $nl + 1;
+                $nl = \strpos($raw, "\n", $pos + 52);
+                $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
+                $pos = $nl + 1;
 
-            $nl = \strpos($raw, "\n", $pos + 52);
-            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
-            $pos = $nl + 1;
+                $nl = \strpos($raw, "\n", $pos + 52);
+                $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
+                $pos = $nl + 1;
 
-            $nl = \strpos($raw, "\n", $pos + 52);
-            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
-            $pos = $nl + 1;
+                $nl = \strpos($raw, "\n", $pos + 52);
+                $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
+                $pos = $nl + 1;
 
-            $nl = \strpos($raw, "\n", $pos + 52);
-            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
-            $pos = $nl + 1;
+                $nl = \strpos($raw, "\n", $pos + 52);
+                $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
+                $pos = $nl + 1;
 
-            $nl = \strpos($raw, "\n", $pos + 52);
-            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
-            $pos = $nl + 1;
+                $nl = \strpos($raw, "\n", $pos + 52);
+                $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
+                $pos = $nl + 1;
+            } while ($pos < $fence);
         }
 
-        while ($pos < $lastNl) {
-            $nl = \strpos($raw, "\n", $pos + 52);
-            if ($nl === false || $nl > $lastNl) break;
-            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
-            $pos = $nl + 1;
+        if ($pos < $lastNl) {
+            do {
+                $nl = \strpos($raw, "\n", $pos + 52);
+                if ($nl === false || $nl > $lastNl) break;
+                $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
+                $pos = $nl + 1;
+            } while ($pos < $lastNl);
         }
-    }
+    } while ($remaining > 0);
     \fclose($fh);
     return $buckets;
 }
@@ -130,7 +134,7 @@ final class Parser
         $idToDate = [];
         $dateId = 0;
         $daysInMonth = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-        for ($year = 2019; $year <= 2028; $year++) {
+        for ($year = 2019; $year <= 2026; $year++) {
             $isLeap = ($year % 4 === 0 && ($year % 100 !== 0 || $year % 400 === 0));
             for ($month = 1; $month <= 12; $month++) {
                 $days = $daysInMonth[$month];
@@ -198,9 +202,11 @@ final class Parser
         $mergedBuckets = \array_fill_keys($slugOrderList, '');
         $drained = 0;
 
-        while ($drained < $numWorkers) {
+        do {
             $pid = \pcntl_waitpid(-1, $status);
-            if ($pid <= 0) continue;
+            if ($pid <= 0) {
+                continue;
+            }
 
             $w = $pidToWorker[$pid];
             $tmpFile = $tmpDir . '/parser_w' . $w;
@@ -220,7 +226,7 @@ final class Parser
             unset($data);
 
             $drained++;
-        }
+        } while ($drained < $numWorkers);
 
         $numCounters = 10;
         $numSlugs = \count($slugOrderList);
