@@ -8,7 +8,6 @@ function _hotLoop(
     string $inputPath, int $start, int $end,
     array $dateToId, array $slugOrderList, int $chunkSize
 ): array {
-    // Pre-initialize ALL buckets — no undefined key notices, no error handler needed
     $buckets = \array_fill_keys($slugOrderList, '');
 
     $fh = \fopen($inputPath, 'rb');
@@ -72,26 +71,6 @@ function _hotLoop(
     return $buckets;
 }
 
-function _processSegmentFile(
-    string $inputPath, int $start, int $end,
-    array $dateToId, array $slugOrderList,
-    string $tmpFile, int $chunkSize
-): void {
-    $buckets = _hotLoop($inputPath, $start, $end, $dateToId, $slugOrderList, $chunkSize);
-
-    // Build slug index for compact IPC
-    $slugToIdx = \array_flip($slugOrderList);
-
-    // Serialize: send raw bucket strings (parent will do batch counting)
-    $out = '';
-    foreach ($buckets as $slug => $packed) {
-        if ($packed === '') continue;
-        $idx = $slugToIdx[$slug] ?? 0xFFFF;
-        $out .= \pack('vV', $idx, \strlen($packed)) . $packed;
-    }
-    \file_put_contents($tmpFile, $out);
-}
-
 final class Parser
 {
     public function parse(string $inputPath, string $outputPath): void
@@ -99,7 +78,7 @@ final class Parser
         \gc_disable();
 
         $numWorkers = 10;
-        $chunkSize  = 2097152; // 2 MB
+        $chunkSize  = 262144; // 256 KB
 
         // Discover slugs from first 4 MB
         $slugOrder = [];
@@ -121,7 +100,7 @@ final class Parser
         $slugOrderList = \array_keys($slugOrder);
         unset($sample, $slugOrder);
 
-        // Pre-enumerate dates (2019–2028, leap year aware)
+        // Pre-enumerate dates (2019-2028, leap year aware)
         $dateToId = [];
         $idToDate = [];
         $dateId = 0;
@@ -153,47 +132,115 @@ final class Parser
         $boundaries[] = $fileSize;
         \fclose($fh);
 
-        // Fork workers with temp file IPC
-        $tmpDir = \sys_get_temp_dir();
-        $parentPid = \getmypid();
+        // Build slug index for compact IPC
+        $slugToIdx = \array_flip($slugOrderList);
+
+        // Create socket pairs before forking (one pair per child worker)
+        $sockets = [];
+        for ($w = 0; $w < $numWorkers - 1; $w++) {
+            $pair = \stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+            $sockets[$w] = $pair; // [0] = parent end, [1] = child end
+        }
+
+        // Fork workers with socket pair IPC
         $childPids = [];
 
         for ($w = 0; $w < $numWorkers - 1; $w++) {
             $pid = \pcntl_fork();
             if ($pid === 0) {
-                // CHILD: process segment, write to temp file, exit
-                _processSegmentFile(
+                // CHILD: close parent ends of all sockets and sibling child ends
+                for ($i = 0; $i < $numWorkers - 1; $i++) {
+                    \fclose($sockets[$i][0]);
+                    if ($i !== $w) {
+                        \fclose($sockets[$i][1]);
+                    }
+                }
+
+                // Process segment
+                $buckets = _hotLoop(
                     $inputPath, $boundaries[$w], $boundaries[$w + 1],
-                    $dateToId, $slugOrderList,
-                    $tmpDir . '/p_' . $parentPid . '_' . $w,
-                    $chunkSize
+                    $dateToId, $slugOrderList, $chunkSize
                 );
+
+                // Serialize: same format as temp file IPC
+                $out = '';
+                foreach ($buckets as $slug => $packed) {
+                    if ($packed === '') continue;
+                    $idx = $slugToIdx[$slug] ?? 0xFFFF;
+                    $out .= \pack('vV', $idx, \strlen($packed)) . $packed;
+                }
+                unset($buckets);
+
+                // Write to socket in chunks
+                $sock = $sockets[$w][1];
+                $len = \strlen($out);
+                $written = 0;
+                while ($written < $len) {
+                    $n = \fwrite($sock, \substr($out, $written, 65536));
+                    if ($n === false) break;
+                    $written += $n;
+                }
+                \fclose($sock);
                 exit(0);
             }
             $childPids[] = $pid;
         }
 
-        // Parent processes last segment
+        // Parent closes all child ends of sockets
+        for ($w = 0; $w < $numWorkers - 1; $w++) {
+            \fclose($sockets[$w][1]);
+        }
+
+        // Parent processes its own segment (last segment)
         $parentBuckets = _hotLoop(
             $inputPath, $boundaries[$numWorkers - 1], $boundaries[$numWorkers],
             $dateToId, $slugOrderList, $chunkSize
         );
 
-        // Wait for ALL children to finish
+        // Use stream_select to read from children as they finish
+        $parentSocks = [];
+        for ($w = 0; $w < $numWorkers - 1; $w++) {
+            $parentSocks[$w] = $sockets[$w][0];
+            \stream_set_blocking($parentSocks[$w], false);
+        }
+
+        $buffers = \array_fill(0, $numWorkers - 1, '');
+        $remaining = $numWorkers - 1;
+
+        while ($remaining > 0) {
+            $read = \array_values(\array_filter($parentSocks, fn($s) => $s !== null));
+            if (empty($read)) break;
+            $write = null;
+            $except = null;
+            if (\stream_select($read, $write, $except, 1) > 0) {
+                foreach ($read as $sock) {
+                    $w = \array_search($sock, $parentSocks, true);
+                    $data = \fread($sock, 65536);
+                    if ($data === '' || $data === false) {
+                        // Socket closed = child done
+                        \fclose($sock);
+                        $parentSocks[$w] = null;
+                        $remaining--;
+                    } else {
+                        $buffers[$w] .= $data;
+                    }
+                }
+            }
+        }
+
+        // Wait for children (they should already be done since we read all data)
         foreach ($childPids as $pid) {
             \pcntl_waitpid($pid, $status);
         }
 
-        // Merge: concatenate raw bucket strings from all sources, then batch count
-        // Start with parent's buckets
+        // Merge: start with parent's buckets
         $mergedBuckets = $parentBuckets;
         unset($parentBuckets);
 
-        // Read child temp files and concatenate bucket strings
+        // Deserialize child results from buffers
         for ($w = 0; $w < $numWorkers - 1; $w++) {
-            $tmpFile = $tmpDir . '/p_' . $parentPid . '_' . $w;
-            $data = \file_get_contents($tmpFile);
-            \unlink($tmpFile);
+            $data = $buffers[$w];
+            unset($buffers[$w]);
             $offset = 0;
             $dataLen = \strlen($data);
             while ($offset < $dataLen) {
@@ -205,34 +252,31 @@ final class Parser
             }
         }
 
-        // Batch count: one unpack + array_count_values per slug (C-level speed)
-        $merged = [];
-        foreach ($mergedBuckets as $slug => $packed) {
+        // Fused batch count + JSON output (single pass per slug for cache locality)
+        $bufferSize = 65536;
+        $fhOut = \fopen($outputPath, 'wb');
+        $buf = "{\n";
+        $separator = '';
+        foreach ($slugOrderList as $slug) {
+            $packed = $mergedBuckets[$slug];
             if ($packed === '') continue;
-            $merged[$slug] = \array_count_values(\unpack('v*', $packed));
+            $counts = \array_count_values(\unpack('v*', $packed));
+            \ksort($counts);
+            $entries = [];
+            foreach ($counts as $dId => $cnt) {
+                $entries[] = '        "' . $idToDate[$dId] . '": ' . $cnt;
+            }
+            $buf .= $separator . '    "\/blog\/' . $slug . '": {' . "\n"
+                  . \implode(",\n", $entries) . "\n    }";
+            $separator = ",\n";
+            if (\strlen($buf) >= $bufferSize) {
+                \fwrite($fhOut, $buf);
+                $buf = '';
+            }
         }
         unset($mergedBuckets);
-
-        // JSON output — sort by dateId (chronological integer order), build string
-        $json = "{\n";
-        $firstSlug = true;
-        foreach ($slugOrderList as $slug) {
-            if (!isset($merged[$slug])) continue;
-            if (!$firstSlug) $json .= ",\n";
-            $firstSlug = false;
-
-            \ksort($merged[$slug]); // sort by dateId integers (chronological)
-
-            $json .= '    ' . \json_encode('/blog/' . $slug) . ": {\n";
-            $firstDate = true;
-            foreach ($merged[$slug] as $dId => $cnt) {
-                if (!$firstDate) $json .= ",\n";
-                $firstDate = false;
-                $json .= '        "' . $idToDate[$dId] . '": ' . $cnt;
-            }
-            $json .= "\n    }";
-        }
-        $json .= "\n}";
-        \file_put_contents($outputPath, $json);
+        $buf .= "\n}";
+        \fwrite($fhOut, $buf);
+        \fclose($fhOut);
     }
 }
