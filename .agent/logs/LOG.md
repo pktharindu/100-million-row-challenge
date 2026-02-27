@@ -1,10 +1,11 @@
 # Parser Optimization Knowledge Base
 
 ## Current State
-- **Best time:** 0.388s mean (10M rows, M4 Pro 14-core)
-- **Iteration count:** 9
+- **Best parser time:** ~151ms (reported by `data:parse` stdout — THIS is the real metric, see MEASUREMENT CORRECTION below)
+- **Best wall-clock:** 0.388s mean (hyperfine — includes ~237ms PHP+Tempest overhead, do NOT use for comparisons)
+- **Iteration count:** 9 (REASSESSING — previous "no improvement" decisions may have been masked by wrong metric)
 - **Parser architecture:** Adaptive worker count (perflevel0-based, 10 on M4 Pro, 6 on M1), socket_create_pair + socket_export_stream with 2MB SO_SNDBUF/SO_RCVBUF, unbuffered I/O (stream_set_read_buffer 0), **sequential stream_get_contents drain + inline TLV merge**, 6x loop unrolling, bucket accumulation with 2-byte date IDs, 512KB read chunks, zero-copy hot loop, 8 parallel counting workers with ksort-free iteration (idToDate), SIGKILL fast exit, 262KB child write / 512KB count write, inline JSON building, 2MB slug sample
-- **Target:** ~380ms (approaching I/O + overhead floor)
+- **Target:** ~120-136ms parser time (interpreter floor estimate). Room: ~15-31ms (10-20%)
 
 ## Bottleneck Model (UPDATED iter9 profiling)
 | Phase | Time | % Internal | Serial? |
@@ -21,9 +22,9 @@
 
 **Key iter9 discovery:** stream_select drain was 14.6ms, NOT 2ms as previously estimated. Root causes: multiple stream_select iterations, non-blocking mode overhead, O(n^2) string concat in buffers. Sequential stream_get_contents + inline merge: ~8ms total. C-level internal buffering avoids PHP string reallocation.
 
-**Primary bottleneck:** parent_hotloop (~107ms, 66.5%). At PHP interpreter floor (~120ns/row).
-**Secondary bottleneck:** PHP/Tempest overhead (~237ms, 61% of wall time). Irreducible.
-**Tertiary:** count_phase (~22.5ms). Highly optimized with 8 workers + large socket buffers.
+**Primary bottleneck:** parent_hotloop (~107ms, 66.5% of PARSER time). Near PHP interpreter floor (~120ns/row).
+**NOT a bottleneck:** PHP/Tempest overhead (~237ms) is OUTSIDE the measured parser time. `data:parse` only times `Parser::parse()` internally. Hyperfine wall-clock includes this overhead but it is NOT optimizable. Ignore it for comparisons.
+**Secondary:** count_phase (~22.5ms). Highly optimized with 8 workers + large socket buffers.
 
 ## Technique Status
 
@@ -73,16 +74,41 @@
 
 stream_select drain was consuming 14.6ms (not 2ms estimated). Root cause: multiple iterations, non-blocking mode overhead, O(n^2) string growth. Sequential stream_get_contents + inline merge: ~8ms. Also 31 fewer lines of code.
 
-## COMPLETE Assessment (iter9)
+## MEASUREMENT CORRECTION (HUMAN-DIRECTED — DO NOT OVERWRITE)
 
-Trajectory: 3906->558->521->483->480->418->406->396->396->388ms.
-Gains: -85.7%, -6.7%, -7.3%, -0.6%, -12.9%, -3.9%, -4.4%, 0%, -2%.
+**CRITICAL: All previous iterations used hyperfine wall-clock time as the metric. This is WRONG.**
 
-Within 3.2% of estimated I/O floor (~376ms). All major techniques tried. Remaining ideas: work stealing (cannot test locally), deferred waitpid (~0.2ms), fence tightening (<0.1%). Next iteration should try remaining micro-opts; if no improvement, emit COMPLETE.
+`hyperfine` measures: PHP startup + Tempest boot + `Parser::parse()` + output = ~388ms.
+`DataParseCommand` reports: ONLY `Parser::parse()` time = ~151ms (printed to stdout).
+
+The ~237ms of PHP+Tempest overhead is FIXED and UNOPTIMIZABLE — it's outside `Parser.php`. Previous iterations were comparing candidates against a denominator inflated by ~60% fixed overhead. This means:
+- A 5ms parser improvement (3.3% of parser time) looked like only 1.3% in hyperfine (5/388) — **below the 2% revert threshold**
+- **Real improvements may have been reverted as "noise"**
+- The "I/O floor" of ~376ms is meaningless — that includes overhead. The parser's floor is ~120-136ms.
+
+**Corrected metrics:**
+- Parser time: ~151ms (the REAL metric going forward)
+- Parser floor estimate: ~120-136ms (interpreter cost at ~120ns/row × 10M rows ÷ 10 workers)
+- Room for improvement: ~15-31ms (10-20% from current parser time)
+- 2% threshold should apply to PARSER time (~151ms × 2% = ~3ms), not wall-clock
+
+**Action:** Extract the parser-reported time from `data:parse` stdout: `php tempest data:parse 2>&1 | grep -oP '[\d.]+'`
+Use THAT for all comparisons. Hyperfine is still useful for variance/consistency but NOT for absolute comparison.
+
+**Previous COMPLETE assessment is RESCINDED.** There may be real gains masked by measurement error. Re-evaluate with corrected metrics.
+
+## Remaining Ideas (re-assessed with corrected parser-time metrics)
+1. Work stealing for M1 — can't test locally, regresses on M4 Pro. Still worth trying on real M1.
+2. Revisit ANY previously reverted candidate that was "under 2% threshold" — it may have been a real improvement when measured against parser time only.
+3. Merge-during-drain — saves ~4ms = 2.6% of parser time. NOW above threshold.
+4. Setup micro-opts (iter8 candidate C) — was -1.2% of wall-clock (~4.7ms). As % of parser time: ~3.1%. NOW above threshold.
+5. Deferred waitpid, fence tightening — small but may be above threshold when measured correctly.
 
 ## Performance Timeline
 
-| Iteration | Best Time | Change | Delta |
+**NOTE:** All times below are hyperfine WALL-CLOCK times (includes ~237ms PHP+Tempest overhead). Parser-only times are ~237ms less. Future iterations should record PARSER time as primary metric.
+
+| Iteration | Best Time (wall) | Change | Delta |
 |-----------|-----------|--------|-------|
 | 0 | 3.906s | Naive single-process | -- |
 | 1 | 0.558s | Multi-process + bucket accumulation | -85.7% |

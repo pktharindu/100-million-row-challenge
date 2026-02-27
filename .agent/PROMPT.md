@@ -189,7 +189,17 @@ Skip any candidates the subagent reported as FAIL in verification. For each rema
    ```
    If `hyperfine` is unavailable, run manually with 5 runs, discard best/worst, take median of middle 3.
 
-5. **Record results** for this candidate: median time, variance, pass/fail.
+   **CRITICAL — Understanding the measurement:**
+   `hyperfine` measures WALL-CLOCK time of the entire command: PHP startup + Tempest framework boot + `Parser::parse()` + output. On this machine, PHP+Tempest overhead is ~280–350ms of FIXED cost that you CANNOT optimize (you only control `Parser.php`).
+
+   The REAL metric is the **parser time printed to stdout** by `data:parse` — that's the `$executionTime` measured inside `DataParseCommand.php` which wraps ONLY the `Parser::parse()` call. Extract it like this:
+   ```bash
+   php tempest data:parse 2>&1 | grep -oP '[\d.]+'
+   ```
+
+   Use `hyperfine` for consistency checks (low stddev = stable system), but **always extract and record the parser-reported time as the primary metric**. When comparing candidates, compare parser times, not hyperfine wall-clock times.
+
+5. **Record results** for this candidate: parser-reported time (primary), hyperfine wall-clock (secondary), variance, pass/fail.
 
 6. **Restore baseline** before testing next candidate:
    ```bash
