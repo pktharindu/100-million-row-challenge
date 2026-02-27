@@ -76,8 +76,10 @@ The parser processes CSV lines of format:
 - **The hot loop is near PHP's interpreter floor** at ~120ns/row.
 - **stream_set_read_buffer($fh, 0) is CRITICAL** — PHP's default 8KB read buffer causes double-buffering with large fread() calls. Disabling it gave a 38% system-time reduction. ALWAYS include this after fopen() in hot loop workers.
 - **Child write chunks should be ≥256KB** — With 2MB SO_SNDBUF, writing in 64KB chunks wastes syscalls. Use 262144 for parsing workers, 524288 for counting workers.
-- **Worker count is now adaptive** — uses `sysctl -n hw.perflevel0.logicalcpu` to detect Apple Silicon performance cores. max(perflevel0, 6). On M4 Pro: 10, on M1: 6.
-- **Counting workers use idToDate iteration (not ksort)** — since date IDs are chronological, iterating $idToDate and checking isset($counts[$dId]) produces sorted output without ksort().
+- **Worker count is now cached** — CPU core count is cached in a temp file (`sys_get_temp_dir()/.parser_cpu_perf`). First run calls sysctl, subsequent runs read from file (~0.1ms vs ~5ms). The adaptive logic: max(perflevel0, 6). On M4 Pro: 10, on M1: 6.
+- **Counting workers use dateJsonPrefix iteration (not idToDate)** — pre-computed JSON prefix strings ('        "YYYY-MM-DD": ') iterate in the same chronological order as idToDate, producing sorted output without ksort(). This saves 2 string concatenations per date entry in counting workers.
+- **NEVER replace PHP C-level operations with userland arithmetic.** PHP's internal hash table lookups on short strings (8 bytes) are FASTER than equivalent userland ord()+math computations. Iter11 proved: replacing `$dateToId[substr($raw, $nl-23, 8)]` with arithmetic index computation caused +30% regression. The zend_string allocation from substr is cheap; the opcode overhead of multiple ord() calls is not.
+- **Tempest registers a custom error handler** — `@` suppression does NOT work for file operations. Use `\file_exists()` guard before `\file_get_contents()` to avoid ErrorException from warnings.
 
 ## Response format
 
