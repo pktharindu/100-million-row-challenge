@@ -21,49 +21,65 @@ function _hotLoop(
         if ($raw === false || $raw === '') break;
         $remaining -= \strlen($raw);
 
-        $chunk = $leftover . $raw;
-        $lastNl = \strrpos($chunk, "\n");
-        if ($lastNl === false) {
-            $leftover = $chunk;
+        // Handle boundary line from previous read (zero-copy: no $leftover.$raw concat)
+        if ($leftover !== '') {
+            $firstNl = \strpos($raw, "\n");
+            if ($firstNl === false) {
+                $leftover .= $raw;
+                continue;
+            }
+            // Complete the boundary line
+            $line = $leftover . \substr($raw, 0, $firstNl);
+            $lineLen = \strlen($line);
+            $buckets[\substr($line, 25, $lineLen - 51)] .= $dateToId[\substr($line, $lineLen - 25, 10)];
+            $leftover = '';
+            $pos = $firstNl + 1;
+        } else {
+            $pos = 0;
+        }
+
+        // Find last newline in $raw
+        $lastNl = \strrpos($raw, "\n");
+        if ($lastNl === false || $lastNl < $pos) {
+            $leftover = ($pos > 0) ? \substr($raw, $pos) : $raw;
             continue;
         }
-        $leftover = \substr($chunk, $lastNl + 1);
+        $leftover = ($lastNl + 1 < \strlen($raw)) ? \substr($raw, $lastNl + 1) : '';
 
-        $pos = 0;
         $fence = $lastNl - 720;
 
-        // 6x unrolled
+        // 6x unrolled loop (operating on $raw instead of $chunk)
         while ($pos < $fence) {
-            $nl = \strpos($chunk, "\n", $pos + 52);
-            $buckets[\substr($chunk, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($chunk, $nl - 25, 10)];
+            $nl = \strpos($raw, "\n", $pos + 52);
+            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 25, 10)];
             $pos = $nl + 1;
 
-            $nl = \strpos($chunk, "\n", $pos + 52);
-            $buckets[\substr($chunk, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($chunk, $nl - 25, 10)];
+            $nl = \strpos($raw, "\n", $pos + 52);
+            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 25, 10)];
             $pos = $nl + 1;
 
-            $nl = \strpos($chunk, "\n", $pos + 52);
-            $buckets[\substr($chunk, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($chunk, $nl - 25, 10)];
+            $nl = \strpos($raw, "\n", $pos + 52);
+            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 25, 10)];
             $pos = $nl + 1;
 
-            $nl = \strpos($chunk, "\n", $pos + 52);
-            $buckets[\substr($chunk, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($chunk, $nl - 25, 10)];
+            $nl = \strpos($raw, "\n", $pos + 52);
+            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 25, 10)];
             $pos = $nl + 1;
 
-            $nl = \strpos($chunk, "\n", $pos + 52);
-            $buckets[\substr($chunk, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($chunk, $nl - 25, 10)];
+            $nl = \strpos($raw, "\n", $pos + 52);
+            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 25, 10)];
             $pos = $nl + 1;
 
-            $nl = \strpos($chunk, "\n", $pos + 52);
-            $buckets[\substr($chunk, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($chunk, $nl - 25, 10)];
+            $nl = \strpos($raw, "\n", $pos + 52);
+            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 25, 10)];
             $pos = $nl + 1;
         }
 
         // Cleanup remainder
         while ($pos < $lastNl) {
-            $nl = \strpos($chunk, "\n", $pos + 52);
+            $nl = \strpos($raw, "\n", $pos + 52);
             if ($nl === false || $nl > $lastNl) break;
-            $buckets[\substr($chunk, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($chunk, $nl - 25, 10)];
+            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 25, 10)];
             $pos = $nl + 1;
         }
     }
@@ -78,7 +94,7 @@ final class Parser
         \gc_disable();
 
         $numWorkers = 10;
-        $chunkSize  = 262144; // 256 KB
+        $chunkSize  = 524288; // 512 KB
 
         // Discover slugs from first 4 MB
         $slugOrder = [];
@@ -139,7 +155,7 @@ final class Parser
         $sockets = [];
         for ($w = 0; $w < $numWorkers - 1; $w++) {
             $pair = \stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
-            $sockets[$w] = $pair; // [0] = parent end, [1] = child end
+            $sockets[$w] = $pair;
         }
 
         // Fork workers with socket pair IPC
@@ -148,7 +164,6 @@ final class Parser
         for ($w = 0; $w < $numWorkers - 1; $w++) {
             $pid = \pcntl_fork();
             if ($pid === 0) {
-                // CHILD: close parent ends of all sockets and sibling child ends
                 for ($i = 0; $i < $numWorkers - 1; $i++) {
                     \fclose($sockets[$i][0]);
                     if ($i !== $w) {
@@ -156,13 +171,11 @@ final class Parser
                     }
                 }
 
-                // Process segment
                 $buckets = _hotLoop(
                     $inputPath, $boundaries[$w], $boundaries[$w + 1],
                     $dateToId, $slugOrderList, $chunkSize
                 );
 
-                // Serialize: same format as temp file IPC
                 $out = '';
                 foreach ($buckets as $slug => $packed) {
                     if ($packed === '') continue;
@@ -171,7 +184,6 @@ final class Parser
                 }
                 unset($buckets);
 
-                // Write to socket in chunks
                 $sock = $sockets[$w][1];
                 $len = \strlen($out);
                 $written = 0;
@@ -186,18 +198,15 @@ final class Parser
             $childPids[] = $pid;
         }
 
-        // Parent closes all child ends of sockets
         for ($w = 0; $w < $numWorkers - 1; $w++) {
             \fclose($sockets[$w][1]);
         }
 
-        // Parent processes its own segment (last segment)
         $parentBuckets = _hotLoop(
             $inputPath, $boundaries[$numWorkers - 1], $boundaries[$numWorkers],
             $dateToId, $slugOrderList, $chunkSize
         );
 
-        // Use stream_select to read from children as they finish
         $parentSocks = [];
         for ($w = 0; $w < $numWorkers - 1; $w++) {
             $parentSocks[$w] = $sockets[$w][0];
@@ -217,7 +226,6 @@ final class Parser
                     $w = \array_search($sock, $parentSocks, true);
                     $data = \fread($sock, 65536);
                     if ($data === '' || $data === false) {
-                        // Socket closed = child done
                         \fclose($sock);
                         $parentSocks[$w] = null;
                         $remaining--;
@@ -228,16 +236,13 @@ final class Parser
             }
         }
 
-        // Wait for children (they should already be done since we read all data)
         foreach ($childPids as $pid) {
             \pcntl_waitpid($pid, $status);
         }
 
-        // Merge: start with parent's buckets
         $mergedBuckets = $parentBuckets;
         unset($parentBuckets);
 
-        // Deserialize child results from buffers
         for ($w = 0; $w < $numWorkers - 1; $w++) {
             $data = $buffers[$w];
             unset($buffers[$w]);
@@ -257,7 +262,6 @@ final class Parser
         $numSlugs = \count($slugOrderList);
         $slugsPerCounter = (int)\ceil($numSlugs / $numCounters);
 
-        // Create pipe pairs for counting workers
         $countPipes = [];
         for ($c = 0; $c < $numCounters; $c++) {
             $countPipes[$c] = \stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
@@ -267,7 +271,6 @@ final class Parser
         for ($c = 0; $c < $numCounters; $c++) {
             $pid = \pcntl_fork();
             if ($pid === 0) {
-                // Child: close parent ends and sibling child ends
                 for ($i = 0; $i < $numCounters; $i++) {
                     \fclose($countPipes[$i][0]);
                     if ($i !== $c) \fclose($countPipes[$i][1]);
@@ -311,13 +314,11 @@ final class Parser
             $countPids[] = $pid;
         }
 
-        // Parent: close child ends
         for ($c = 0; $c < $numCounters; $c++) {
             \fclose($countPipes[$c][1]);
         }
         unset($mergedBuckets);
 
-        // Read fragments in order and write output
         $fhOut = \fopen($outputPath, 'wb');
         \fwrite($fhOut, "{\n");
         $needSep = false;
