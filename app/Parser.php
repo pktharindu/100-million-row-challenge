@@ -208,49 +208,14 @@ final class Parser
             $dateToId, $slugOrderList, $chunkSize
         );
 
-        // Change 2: Optimized drain loop with pre-built int-keyed map (no array_filter + array_search)
-        $sockToW = [];
-        $activeSocks = [];
-        for ($w = 0; $w < $numWorkers - 1; $w++) {
-            $parentSocks[$w] = $sockets[$w][0];
-            \stream_set_blocking($parentSocks[$w], false);
-            $sockToW[(int)$parentSocks[$w]] = $w;
-            $activeSocks[$w] = $parentSocks[$w];
-        }
-
-        $buffers = \array_fill(0, $numWorkers - 1, '');
-        $remaining = $numWorkers - 1;
-
-        while ($remaining > 0) {
-            $read = $activeSocks;
-            if (empty($read)) break;
-            $write = null;
-            $except = null;
-            if (\stream_select($read, $write, $except, 1) > 0) {
-                foreach ($read as $sock) {
-                    $w = $sockToW[(int)$sock];
-                    $data = \fread($sock, 2097152);
-                    if ($data === '' || $data === false) {
-                        \fclose($sock);
-                        unset($activeSocks[$w]);
-                        $remaining--;
-                    } else {
-                        $buffers[$w] .= $data;
-                    }
-                }
-            }
-        }
-
-        foreach ($childPids as $pid) {
-            \pcntl_waitpid($pid, $status);
-        }
-
+        // Sequential blocking drain + inline merge (faster than stream_select at 10M)
         $mergedBuckets = $parentBuckets;
         unset($parentBuckets);
 
         for ($w = 0; $w < $numWorkers - 1; $w++) {
-            $data = $buffers[$w];
-            unset($buffers[$w]);
+            $data = \stream_get_contents($sockets[$w][0]);
+            \fclose($sockets[$w][0]);
+
             $offset = 0;
             $dataLen = \strlen($data);
             while ($offset < $dataLen) {
@@ -260,6 +225,10 @@ final class Parser
                 $mergedBuckets[$slugOrderList[$slugIdx]] .= \substr($data, $offset, $bucketLen);
                 $offset += $bucketLen;
             }
+        }
+
+        foreach ($childPids as $pid) {
+            \pcntl_waitpid($pid, $status);
         }
 
         $numCounters = 8;
