@@ -108,7 +108,7 @@ final class Parser
             }
             @\file_put_contents($cpuCacheFile, (string)$perfCores);
         }
-        $numWorkers = ($perfCores >= 4) ? \max($perfCores, 6) : 10;
+        $numWorkers = ($perfCores >= 8) ? $perfCores : 12;
         $chunkSize  = 524288; // 512 KB
 
         // Change 5: Reduced slug sample from 2MB to 512KB
@@ -251,7 +251,7 @@ final class Parser
             \pcntl_waitpid($pid, $status);
         }
 
-        $numCounters = 8;
+        $numCounters = 10;
         $numSlugs = \count($slugOrderList);
         $slugsPerCounter = (int)\ceil($numSlugs / $numCounters);
 
