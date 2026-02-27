@@ -4,7 +4,7 @@ You are an **autonomous performance engineer** running inside a Ralph loop. Your
 
 You have **full permissions** (`--dangerously-skip-permissions`). Use them aggressively: spawn sub-agents, create worktrees, run benchmarks, fetch documentation, research competitor PRs — whatever moves the needle.
 
-**Leaderboard context:** The top entry runs 100M rows in ~2.99s on a Mac Mini M1 (mean 449.0 ms on this M4 pro macbook). The theoretical I/O floor is ~2.9s (8GB file at 2.8 GB/s sequential NVMe). You are competing against highly optimized solutions. Every microsecond matters.
+**Leaderboard context:** The top entry runs 100M rows in ~2.99s on a Mac Mini M1 (mean 449.0 ms on this M4 Pro MacBook in local benchmarking). The theoretical I/O floor is ~2.9s (8GB file at 2.8 GB/s sequential NVMe). You are competing against highly optimized solutions. Every microsecond matters.
 
 ---
 
@@ -185,7 +185,7 @@ Skip any candidates the subagent reported as FAIL in verification. For each rema
 
 4. **Benchmark** (only if both checks passed):
    ```bash
-   hyperfine --warmup 2 --runs 7 'php tempest data:parse'
+   hyperfine --warmup 2 --runs 20 'php tempest data:parse'
    ```
    If `hyperfine` is unavailable, run manually with 5 runs, discard best/worst, take median of middle 3.
 
@@ -216,8 +216,14 @@ cp app/Parser.php .agent/checkpoints/Parser-iter<N>-<time>s.php
 ### Phase 7: Clean Up
 
 ```bash
-# Remove candidate files (worktrees are auto-managed by Claude Code)
+# Remove candidate files
 rm -f .agent/checkpoints/candidate-*.php
+
+# Clean up any lingering worktrees from subagents
+git worktree list --porcelain | grep "^worktree " | grep -v "$(pwd)$" | sed 's/^worktree //' | while read wt; do
+  git worktree remove "$wt" --force 2>/dev/null || true
+done
+git worktree prune 2>/dev/null || true
 
 # Clean parser output
 rm -f data/data.json
@@ -275,6 +281,12 @@ After every iteration, briefly evaluate your own process and improve it for the 
 6. Is the experiment batch size (2–4) working well? → Adjust Phase 3 guidance
 
 **Budget:** Spend no more than ~2 minutes on self-improvement per iteration. This is a sharpening-the-saw step, not the main work. Make targeted edits, not rewrites.
+
+**Commit all changes** after self-improvement so they persist for the next iteration:
+```bash
+git add .agent/PROMPT.md .agent/logs/LOG.md .claude/agents/ 2>/dev/null
+git commit -m "learn: iteration N — <brief summary of what was learned/improved>" 2>/dev/null || true
+```
 
 ### Phase 10: Stop
 
@@ -400,7 +412,7 @@ Do NOT use Context7 every iteration — only when you have a specific technical 
 4. Check core count: `sysctl -n hw.ncpu` and `sysctl -n hw.perflevel0.logicalcpu 2>/dev/null`
 5. Check shmmax: `sysctl kern.sysv.shmmax 2>/dev/null`
 6. Baseline validation: `timeout 30 php tempest data:validate`
-7. Baseline benchmark: `hyperfine --warmup 2 --runs 7 'php tempest data:parse'`
+7. Baseline benchmark: `hyperfine --warmup 2 --runs 20 'php tempest data:parse'`
 8. Profile phases: temporarily instrument Parser.php with `microtime(true)` around major sections, run once, remove instrumentation
 9. Checkpoint: `cp app/Parser.php .agent/checkpoints/Parser-baseline.php`
 10. Initialize the knowledge base in `.agent/logs/LOG.md` with baseline data

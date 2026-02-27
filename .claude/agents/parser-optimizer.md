@@ -52,7 +52,26 @@ The parser processes CSV lines of format:
 
 - URL prefix is always 25 bytes
 - Timestamp after comma is always 25 bytes
+- Minimum line length is 52 bytes (25 prefix + 1 slug char + 1 comma + 25 timestamp)
 - Available extensions include: pcntl, shmop, sysvsem, sysvshm, igbinary, sockets
+
+## Important performance notes (from iteration 2-4 experiments)
+
+- **NEVER move unpack+array_count_values to child parsing workers.** Distributing counting to children was 55% SLOWER. However, forking SEPARATE counting workers after merge (with COW memory sharing) works great — saved 7.3%.
+- **512KB read chunks with zero-copy are optimal.** The hot loop now processes $raw directly (no $leftover.$raw concatenation). Before zero-copy, 256KB was optimal because larger chunks had proportionally larger concatenation overhead. With zero-copy, 512KB is slightly better due to fewer fread syscalls.
+- **json_encode is unnecessary for slug keys** — use escaped literal: `"\/blog\/" . $slug`
+- **The JSON output uses `\` escaped slashes** — `json_encode('/blog/slug')` produces `"\/blog\/slug"`. If you modify JSON output, ensure forward slashes are escaped with `\`.
+- **stream_socket_pair for IPC** — current architecture uses Unix socket pairs with stream_select. If you modify IPC, preserve the socket-based approach.
+- **Socket fd cleanup is critical** — children must close all parent socket ends and sibling child socket ends to avoid fd leaks and ensure proper EOF detection.
+- **Work stealing with flock is SLOWER on M4 Pro** (+4.6%). The flock contention outweighs load balancing benefits on homogeneous perf cores. May still be useful on M1 with heterogeneous cores.
+- **Socket buffer size (8KB default) does NOT matter** — drain_wait is compute-bound, not buffer-bound. Increasing to 4MB had no effect.
+- **8x loop unrolling is NOT measurably better than 6x.** Don't bother changing unroll factor.
+- **The parser now has TWO fork phases:** (1) 10 parsing workers, (2) 4 counting+JSON workers. When modifying, understand both phases.
+- **The counting workers receive merged data via COW fork** — they read $mergedBuckets via key-based access (no COW triggered). Each worker processes a range of slugs and sends JSON fragments via pipe.
+- **8-char date keys ("YY-MM-DD" instead of "YYYY-MM-DD") do NOT help.** The 2-byte hash savings is <1ns/lookup. Below noise floor.
+- **do-while loop conversion does NOT help.** Saves 1 branch per ~567 unroll iterations. Below noise floor.
+- **Merge-during-drain does NOT help.** Merge is only 5ms — overlapping with drain's 27ms tail saves too little to measure.
+- **The hot loop is near PHP's interpreter floor** at ~120ns/row. strpos+2×substr+2×hash_lookup+append can't be further reduced without avoiding string creation entirely, which PHP doesn't support for hash table keys.
 
 ## Response format
 
