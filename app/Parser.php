@@ -93,13 +93,22 @@ final class Parser
     {
         \gc_disable();
 
-        $perfCores = (int)\trim((string)@\shell_exec('sysctl -n hw.perflevel0.logicalcpu 2>/dev/null'));
-        if ($perfCores >= 4) {
-            $numWorkers = \max($perfCores, 6);
-        } else {
-            $ncpu = (int)\trim((string)@\shell_exec('sysctl -n hw.ncpu 2>/dev/null'));
-            $numWorkers = $ncpu >= 4 ? $ncpu : 10;
+        $cpuCacheFile = \sys_get_temp_dir() . '/.parser_cpu_perf';
+        $perfCores = 0;
+        if (\file_exists($cpuCacheFile)) {
+            $cached = \file_get_contents($cpuCacheFile);
+            if ($cached !== false && $cached !== '') {
+                $perfCores = (int)$cached;
+            }
         }
+        if ($perfCores < 1) {
+            $perfCores = (int)\trim((string)@\shell_exec('sysctl -n hw.perflevel0.logicalcpu 2>/dev/null'));
+            if ($perfCores < 1) {
+                $perfCores = (int)\trim((string)@\shell_exec('sysctl -n hw.ncpu 2>/dev/null'));
+            }
+            @\file_put_contents($cpuCacheFile, (string)$perfCores);
+        }
+        $numWorkers = ($perfCores >= 4) ? \max($perfCores, 6) : 10;
         $chunkSize  = 524288; // 512 KB
 
         // Change 5: Reduced slug sample from 2MB to 512KB
@@ -140,6 +149,11 @@ final class Parser
                     $dateId++;
                 }
             }
+        }
+
+        $dateJsonPrefix = [];
+        foreach ($idToDate as $dId => $dateStr) {
+            $dateJsonPrefix[$dId] = '        "' . $dateStr . '": ';
         }
 
         $fileSize = \filesize($inputPath);
@@ -274,9 +288,9 @@ final class Parser
 
                     $fragment .= $separator . '    "\/blog\/' . $slug . '": {' . "\n";
                     $entrySep = '';
-                    foreach ($idToDate as $dId => $dateStr) {
+                    foreach ($dateJsonPrefix as $dId => $prefix) {
                         if (isset($counts[$dId])) {
-                            $fragment .= $entrySep . '        "' . $dateStr . '": ' . $counts[$dId];
+                            $fragment .= $entrySep . $prefix . $counts[$dId];
                             $entrySep = ",\n";
                         }
                     }
