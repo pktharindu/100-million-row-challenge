@@ -61,11 +61,11 @@ The parser processes CSV lines of format:
 - **512KB read chunks with zero-copy are optimal.** The hot loop now processes $raw directly (no $leftover.$raw concatenation).
 - **json_encode is unnecessary for slug keys** — use escaped literal: `"\/blog\/" . $slug`
 - **The JSON output uses `\` escaped slashes** — `json_encode('/blog/slug')` produces `"\/blog\/slug"`. If you modify JSON output, ensure forward slashes are escaped with `\`.
-- **stream_socket_pair for IPC** — current architecture uses Unix socket pairs with stream_select. If you modify IPC, preserve the socket-based approach.
-- **Socket fd cleanup is critical** — children must close all parent socket ends and sibling child socket ends to avoid fd leaks and ensure proper EOF detection.
-- **SOCKET BUFFER LIMIT**: macOS default socket buffer is **8KB** (`net.local.stream.recvspace`). If a child writes more than 8KB without the parent reading, the child BLOCKS on fwrite. If the parent is blocked on pcntl_waitpid at the same time, this causes a DEADLOCK. The current architecture uses stream_select to drain concurrently, avoiding this. **NEVER use blocking pcntl_waitpid before draining sockets when data exceeds 8KB.**
+- **IPC uses socket_create_pair + socket_export_stream** — current architecture creates raw sockets via the `sockets` extension, sets SO_SNDBUF/SO_RCVBUF to 2MB via socket_set_option, then exports to PHP streams with socket_export_stream. If you modify IPC creation, use this pattern (NOT stream_socket_pair which has 8KB default buffers).
+- **Socket fd cleanup is critical** — children must close all parent socket ends and sibling child socket ends to avoid fd leaks and ensure proper EOF detection. fclose() works on exported streams.
+- **SOCKET BUFFER LIMIT**: With 2MB buffers set via socket_set_option, workers can write up to ~2MB without blocking. At 100M scale, parsing workers send ~20MB each, so concurrent drain via stream_select is still needed. **NEVER use blocking pcntl_waitpid before draining sockets when data exceeds buffer size.**
 - **Work stealing with flock is SLOWER on M4 Pro** (+4.6%).
-- **Socket buffer size tuning does NOT matter** — drain is compute-bound.
+- **Socket buffer size already tuned to 2MB** via socket_set_option. kern.ipc.maxsockbuf is 8MB.
 - **8x loop unrolling is NOT measurably better than 6x.**
 - **The parser now has TWO fork phases:** (1) 10 parsing workers, (2) **8** counting+JSON workers. When modifying, understand both phases.
 - **The counting workers receive merged data via COW fork** — they read $mergedBuckets via key-based access. Each worker processes a range of slugs and sends JSON fragments via pipe.
