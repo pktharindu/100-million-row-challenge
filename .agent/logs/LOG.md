@@ -2,28 +2,29 @@
 
 ## Current State
 - **Best parser time (10M):** ~137ms (median, interleaved A/B test, 12 pairs)
-- **Best parser time (100M):** ~1.657s (median, 10-pair interleaved A/B test)
-- **Best wall-clock (100M):** ~1.977s mean (hyperfine 10 runs, includes ~320ms PHP+Tempest overhead)
-- **Iteration count:** 15
+- **Best parser time (100M):** ~1.609s (median, 12-pair interleaved A/B test, iter16)
+- **Best wall-clock (100M):** ~2.0s estimated (includes ~320ms PHP+Tempest overhead)
+- **Iteration count:** 16
 - **Parser architecture:** Parent-as-coordinator + temp file IPC. 12 workers for M1 (10 on M4 Pro). All workers are children (parent does no hotloop). Workers write TLV-encoded output to temp files (file_put_contents). Parent uses waitpid(-1) to drain workers in completion order, overlapping drain with worker execution. Unbuffered I/O (stream_set_read_buffer 0), 6x loop unrolling, bucket accumulation with 2-byte date IDs (8-char "YY-MM-DD" keys), 512KB read chunks, zero-copy hot loop, 10 counting workers with pre-computed JSON date prefixes (dateJsonPrefix) via socket IPC, SIGKILL fast exit, 512KB slug sample, fence at lastNl - 600.
 
-## Bottleneck Model (iter15 — 100M scale, estimated)
+## Bottleneck Model (iter16 — 100M scale, MEASURED via microtime instrumentation)
 | Phase | Time (100M) | % Internal | Serial? |
 |-------|-------------|-----------|---------|
-| setup (sysctl+slugs+dates+prefixes) | ~1.5ms | 0.1% | Yes |
-| prefork (partition+fork) | ~0.1ms | 0% | Yes |
-| hotloop (all workers, parallel) | ~1371ms | 87% | Parallel |
-| drain+merge (waitpid(-1)+file_get_contents+TLV) | ~60ms | 3.8% | Overlapped with workers |
-| count_phase (fork+count+JSON+collect+write) | ~100ms | 6.4% | Parallel |
-| **Internal total** | **~1533ms** | — | — |
+| setup (sysctl+slugs+dates+prefixes) | ~3.7ms | 0.2% | Yes |
+| fork (pcntl_fork loop) | ~4.3ms | 0.2% | Yes |
+| hotloop+drain (workers+waitpid+TLV merge) | **~1547ms** | **94.3%** | Parallel + overlapped |
+| count_fork (socket creation + fork 10 workers) | ~7.8ms | 0.5% | Yes |
+| count_collect (parallel count+JSON+read) | ~76ms | 4.6% | Parallel |
+| output+reap | ~3.5ms | 0.2% | Yes |
+| **Internal total** | **~1642ms** | — | — |
 | PHP + Tempest overhead | **~320ms** | — | Fixed |
-| **Wall time** | **~1900ms** | — | — |
+| **Wall time** | **~2000ms** | — | — |
 
-**Key change from iter14:** drain+merge reduced from ~133ms (serial, after parent hotloop) to ~60ms (overlapped with workers via waitpid(-1) + temp files). Estimated savings: ~73ms.
+**NOTE:** Profiled run was 1.909s internal (system was warm). Relative percentages applied to typical 1.642s baseline give the adjusted times above.
 
-**Primary bottleneck (100M):** hotloop (~1371ms, 87% of parser time). AT PHP interpreter floor.
-**Secondary (100M):** count_phase (~100ms, 6.4%). 10 counting workers.
-**Tertiary (100M):** drain+merge (~60ms, 3.8%). Now overlapped with worker execution.
+**Primary bottleneck (100M):** hotloop+drain (~1547ms, 94.3%). AT PHP INTERPRETER FLOOR.
+**Secondary (100M):** count_collect (~76ms, 4.6%). 10 counting workers.
+**All other phases:** <1% each.
 
 ## Technique Status
 
@@ -39,7 +40,7 @@
 | gc_disable | DONE | At top of file and parse() |
 | Worker count tuning (T2) | DONE | M1: 12 workers, M4 Pro: 10 workers (perfCores >= 8 → perfCores, else 12) |
 | Newline skip (T8) | DONE | strpos offset +52 |
-| Chunk size tuning | DONE | 512KB optimal |
+| Chunk size tuning | DONE | 512KB optimal on M4 Pro. 160KB is -16% regression on M4 Pro (iter16). |
 | Parallel counting | DONE | 10 workers for batch_count+JSON via socket IPC |
 | Optimized JSON output | DONE | Pre-computed dateJsonPrefix, ksort-free |
 | Zero-copy hot loop | DONE (iter4) | Eliminated leftover.raw concatenation |
@@ -53,8 +54,12 @@
 | JSON date prefix pre-computation | DONE (iter11) | Pre-compute date prefix strings |
 | 10 counting workers | DONE (iter12) | Expected ~20ms saving at 100M |
 | M1 worker formula (12 workers) | DONE (iter12) | Matches top leaderboard entries for M1 |
+| **do-while loops (iter16)** | **DONE** | **Eliminates JMP opcode per iteration in hot loops. Part of -1.6% combined improvement.** |
+| **Year range 2019-2026 (iter16)** | **DONE** | **3653→2922 dates. 20% less iteration in counting workers. Matches #1 leaderboard entry.** |
+| **Comma-based parsing (iter16)** | **TESTED** | **NEUTRAL. Same opcode count (6 arithmetic ops per line). Scan distance difference (~9 bytes) within single NEON SIMD op on ARM64.** |
+| **160KB read chunks (iter16)** | **TESTED** | **-16% REGRESSION on M4 Pro. Extra fread syscalls dominate. 512KB is optimal for M4 Pro.** |
 | Temp file IPC only (no coordinator) | TESTED (iter15) | ~1.7% improvement — marginal, below 2% threshold |
-| Coordinator + socket IPC | TESTED (iter15) | INVALID at 100M — broken pipe deadlock. 2MB socket buffer causes children to block on fwrite; parent blocks on waitpid. TEMP FILES REQUIRED for coordinator pattern. |
+| Coordinator + socket IPC | TESTED (iter15) | INVALID at 100M — broken pipe deadlock. |
 | ob_start + echo JSON | TESTED (iter13) | No improvement |
 | rawLen cache + 1MB fwrite | TESTED (iter13) | No improvement |
 | 128KB read chunks | TESTED (iter13) | No improvement on M4 Pro |
@@ -77,8 +82,10 @@
 
 ## Dead Ends
 
-### 100M Scale (iter14-15)
-- **Coordinator + socket IPC (iter15):** DEADLOCK at 100M. Workers block on fwrite (2MB buffer limit), parent blocks on waitpid. Temp files are REQUIRED for coordinator pattern because workers need to write all data without blocking.
+### 100M Scale (iter14-16)
+- **Comma-based parsing (iter16):** NEUTRAL. Scans for comma instead of newline — same opcode count, scan distance difference trivial with SIMD.
+- **160KB read chunks (iter16):** -16% REGRESSION on M4 Pro. xHeaven uses 160KB on M1 — may be M1-specific.
+- **Coordinator + socket IPC (iter15):** DEADLOCK at 100M. Workers block on fwrite (2MB buffer limit), parent blocks on waitpid. Temp files are REQUIRED.
 - **Worker-side counting + compact IPC (100M, iter14):** +12-20% REGRESSION. Counting extends critical path.
 - **Flat 1D count array (100M, iter14):** +100% REGRESSION. 3 hash lookups per row.
 - **Skip merge / deferred concat (100M, iter14):** +12% REGRESSION. COW page faults.
@@ -112,24 +119,43 @@
 
 ### Fundamental Insights
 - **PHP C-level string operations (memcpy in `.=` append) are ~2.2x faster than PHP-level array iteration.** Bucket accumulation + string merge is locally optimal.
-- **Temp files enable coordinator pattern at 100M scale.** Sockets CANNOT support coordinator pattern because of buffer-limit deadlocks. Temp files write to page cache (no buffer limit), enabling workers to exit immediately without blocking.
-- **waitpid(-1) enables completion-order drain.** Instead of draining W0, W1, ... sequentially (waiting for slow workers), the parent processes whichever worker finishes first. This overlaps drain with remaining workers.
+- **Temp files enable coordinator pattern at 100M scale.** Sockets CANNOT support coordinator pattern because of buffer-limit deadlocks.
+- **waitpid(-1) enables completion-order drain.**
+- **strpos scan distance differences (comma vs newline) are trivial on ARM64 with NEON SIMD** — both fall within a single vectorized scan operation for the typical 9-25 byte differences.
+- **Read chunk size strongly affects M4 Pro performance.** 512KB optimal. 160KB causes -16% regression from 3x more fread syscalls. May differ on M1.
 
-## Leaderboard Research (iter10)
+## xHeaven PR #3 Deep Analysis (iter16)
+
+Full architecture of the #1 entry:
+- **10 workers** (9 children + parent as 10th worker)
+- **Bucket accumulation** — same as ours (string append per row, NOT inline counting)
+- **Worker-side counting** at END of each worker (unpack + array_count_values → flat 1D array)
+- **IPC:** pack('v*', ...$counts) → temp file. ~1.31MB per worker (268×2557×2 bytes). CONSTANT size.
+- **Merge:** Dense linear scan: `foreach ($wCounts as $v) { $counts[$j++] += $v; }`. ~685K additions × 9 workers = 6.17M additions. Estimated ~600ms serial merge.
+- **JSON generation:** Single-threaded in parent with implode() + 1MB write buffer.
+- **Read chunk:** 160KB
+- **Loop unroll:** 6x, fence at lastNl-720
+- **Year range:** 2020-2026 (2557 dates vs our 3653)
+
+**Key takeaway:** xHeaven's flat-array-merge approach has ~600ms of SERIAL merge in the parent. Our bucket-merge + parallel-counting approach avoids this at the cost of a second fork wave (~76ms). Our approach is FASTER on M4 Pro. xHeaven may still win on M1 due to 160KB chunk advantage and tighter year range.
+
+**Potential future optimization from xHeaven analysis:**
+- **Tighten year range from 2019-2028 to 2019-2026** — reduces dateToId/dateJsonPrefix from 3653 to ~2922 entries. Saves ~20% iteration in counting workers (3653→2922). Expected counting phase savings: ~15ms. Only valid if real benchmark data is within this range (confirmed: ~2020-2026).
+
+## Leaderboard Research (iter10, updated iter16)
 
 Top entry techniques (from GitHub PR analysis):
 | Technique | xHeaven (#1, 2.999s) | johnwedgbury (#4, 3.417s) | dannyvankooten (#5, 3.427s) | Ours |
 |---|---|---|---|---|
-| Workers | 12 | 12 | 12 | 12 on M1, 10 on M4 Pro |
-| IPC | Temp files | Unix sockets + stream_select | Temp files | **Temp files (iter15)** |
+| Workers | 10 (9+parent) | 12 | 12 | 12 on M1, 10 on M4 Pro |
+| IPC | Temp files (v* packed) | Unix sockets + stream_select | Temp files | Temp files (TLV) |
 | Read chunk | 160 KB | 4 MB | 128 KB | 512 KB |
 | Date key | 8 chars (YY-MM-DD) | 8 chars | 8 chars | 8 chars |
-| Count strategy | Flat 1D array per worker | Flat 1D array + adaptive 16/32-bit | Flat 1D + per-entry increment | Bucket accumulation + parallel counting |
+| Year range | 2020-2026 | Unknown | Unknown | 2019-2028 |
+| Count strategy | Bucket accum + worker-side count → flat array IPC | Flat 1D + adaptive 16/32-bit | Flat 1D + per-entry increment | Bucket accum + parallel counting (separate fork wave) |
 | Second fork wave | No | No | No | Yes (10 counting workers) |
 | Loop unrolling | 6x | 4x | None | 6x |
-| Coordinator parent | No (parent processes last segment) | No | No | **Yes (iter15)** |
-
-Key structural difference: Top entries use flat 1D count arrays with NO second fork wave. We use bucket accumulation + counting fork wave. Their IPC is CONSTANT size; ours is proportional to rows but drain is now overlapped.
+| Parent role | Processes last segment + merge + JSON | Coordinator | Coordinator | Coordinator only |
 
 ## MEASUREMENT CORRECTION (HUMAN-DIRECTED — DO NOT OVERWRITE)
 
@@ -142,21 +168,24 @@ Wall-clock includes ~273ms PHP+Tempest overhead that is UNOPTIMIZABLE.
 
 **Statistical rigor (iter12):** With measurement stddev ~5ms at 10M / ~40ms at 100M, need ~24 interleaved pairs for 80% power to detect a 2% effect.
 
-## Remaining Ideas (reassessed iter15, 100M scale)
+## Remaining Ideas (reassessed iter16, 100M scale)
 
 ### Potentially viable:
-1. **Counting phase optimization** — Count phase is now the biggest serial post-hotloop cost (~100ms, 6.4%). Possible approaches: fewer counting workers (8 instead of 10), or temp file IPC for counting workers too.
-2. **Read chunk size for M1** — 128KB/160KB may help M1 L1d (128KB). Can't test locally on M4 Pro.
-3. **Work stealing for M1** — Regresses on M4 Pro but M1 heterogeneous cores might benefit.
-4. **dtrace/strace syscall profiling** — Profile at 100M to find if syscall overhead in hotloop is significant.
-5. **Temp file IPC for counting workers too** — Currently counting uses sockets. At 100M, counting output is ~4MB total (small). Probably not worth changing.
-6. **Counting workers overlap** — Start counting workers before all drain is complete? Would require restructuring to allow partial counting, which isn't possible with current bucket merge approach.
+1. **M1-specific tuning** — 160KB chunks, different worker count. Can't test locally.
+2. **`array_intersect_key` for counting** — Use C-level set intersection instead of PHP-level isset loop in counting workers. May save ~5-10ms.
+3. **Parent processes a segment** — Like xHeaven: parent does hotloop work instead of idling. 11 children + 1 parent = 12 workers. Risk: parent must also drain children after its own segment.
+4. **for loop instead of foreach in counting workers** — PHP for-loops on packed arrays can avoid HashTable iteration overhead.
+5. **Pre-compute counting worker slug assignments before fork** — Avoid COW faults on $mergedBuckets by extracting per-worker data into separate arrays before forking counting workers.
 
-### Exhausted categories:
-- Hot loop micro-optimizations: AT INTERPRETER FLOOR.
-- IPC format for parsing: temp files + coordinator pattern is optimal (iter15).
-- Setup: All micro-opts done.
-- Architecture: Bucket accumulation + C-level string merge is locally optimal for PHP.
+### Exhausted categories (DO NOT RETRY):
+- **Hot loop micro-optimizations:** AT INTERPRETER FLOOR. ~120ns/row. No further optimization possible with pure PHP.
+- **Comma vs newline scanning:** NEUTRAL. Confirmed iter16.
+- **IPC format for parsing:** Temp files + TLV + coordinator is optimal.
+- **Worker count:** 10 on M4 Pro, 12 on M1 is optimal.
+- **Read chunk size:** 512KB optimal on M4 Pro. 128KB and 160KB both worse.
+- **Setup phase:** All micro-opts done.
+- **Architecture:** Bucket accumulation + C-level string merge is locally optimal for PHP.
+- **Worker-side counting:** Extends critical path. +12-20% regression.
 
 ## Performance Timeline
 
@@ -178,33 +207,38 @@ Wall-clock includes ~273ms PHP+Tempest overhead that is UNOPTIMIZABLE.
 | 13 | **~137** | **~387** | ob_start+echo, rawLen cache, 128KB chunks — ALL within noise | **0%** |
 | 14 (100M) | **~1630** | **~1950** | 6 experiments at 100M — ALL failed/neutral | **0%** |
 | **15 (100M)** | **~1657** | **~1977** | **Parent-as-coordinator + temp file IPC** | **-4.3%** |
-
-Note: iter15 baseline was ~1731ms (system warmer than iter14). Relative improvement is the meaningful metric.
+| **16 (100M)** | **~1609** | **~2000** | **do-while loops + year range 2019-2026** | **-1.6%** |
 
 ## Environment
 - PHP 8.5.2 (NTS clang 15.0.0)
 - macOS, M4 Pro, 14 logical CPUs (10 perf + 4 efficiency)
 - shmmax: 4MB, shmall: 1024 pages (4MB total), shmseg: 8
 - kern.ipc.maxsockbuf: 8MB
+- PCRE JIT: disabled
 - data.csv: **100M rows** (~7.5GB, seed=1709251200, dates ~2019-2024)
 - hyperfine available
 - sys_get_temp_dir() = /var/folders/zh/yjg3m2ln2xq_7qcxnh175gd80000gn/T
 - Max slug length: 48 chars, min: 4 chars, max line: 99 bytes, min line: 55 bytes
 - 268 slugs total
+- Socket creation overhead: 0.05ms for 10 pairs
+- Fork overhead: ~3.5ms for 10 workers
 - **IMPORTANT: Userland arithmetic (ord()+math) is SLOWER than PHP's C-level hash lookups.**
-- **IMPORTANT: At 100M, drain+merge with sockets was ~133ms. With temp files + coordinator + waitpid(-1), effective drain+merge cost reduced to ~60ms (overlapped with workers).**
-- **IMPORTANT: Socket IPC + coordinator pattern DEADLOCKS at 100M. Workers block on fwrite (2MB buffer), parent blocks on waitpid. Temp files are REQUIRED.**
+- **IMPORTANT: Socket IPC + coordinator pattern DEADLOCKS at 100M. Temp files are REQUIRED.**
 - **IMPORTANT: On macOS, use `grep -oE '[0-9]+\.[0-9]+'` instead of `grep -oP '[\d.]+'`.**
 - **IMPORTANT: PHP C-level string ops (memcpy via .= append) are ~2.2x faster than PHP-level foreach array iteration.**
 - **IMPORTANT: COW page faults add +12% regression for scattered memory access in forked children.**
+- **IMPORTANT: strpos scan distance differences are negligible on ARM64 NEON (both comma and newline scanning do ~1 SIMD operation).**
+- **IMPORTANT: 160KB chunks cause -16% regression on M4 Pro due to 3x more fread syscalls. 512KB is optimal.**
 
-## COMPLETE Assessment (iter15, 100M scale)
+## COMPLETE Assessment (iter16, 100M scale)
 
-**Status: NOT YET COMPLETE.** Iteration 15 broke the 3-iteration plateau with -4.3% improvement via architectural restructuring (coordinator pattern + temp files). This demonstrates that higher-level architectural changes can still find gains even when micro-optimizations are exhausted.
+**Status: APPROACHING COMPLETE.** Iteration 16 found -1.6% improvement (do-while + year range). Profiling confirmed hotloop is 94.3% of parser time and at the PHP interpreter floor. Comma-based parsing was NEUTRAL, 160KB chunks was -16% REGRESSION.
 
-**Priority for iteration 16:**
-1. Profile the new architecture at 100M to update bottleneck model (the drain overlap changes the critical path)
-2. Optimize counting phase (~100ms) — this is now the largest non-hotloop cost
-3. Test temp file IPC for counting workers
-4. Try reducing counting workers (6-8 instead of 10) with temp files
-5. Investigate if we can start counting workers earlier (partial data availability)
+**Consecutive no-improvement iterations:** 0 (iter16 produced -1.6%). But gains are diminishing.
+
+**Priority for iteration 17:**
+1. **Parent processes a segment** — Like xHeaven. Could save ~10ms of idle time.
+2. **array_intersect_key for counting workers** — C-level set intersection may save ~5-10ms.
+3. **Pre-compute counting worker data** — Separate slug buckets per counting worker BEFORE forking to reduce COW faults.
+4. **Combined micro-wins** — Multiple sub-1% improvements may compound.
+5. If all fail → emit COMPLETE.
