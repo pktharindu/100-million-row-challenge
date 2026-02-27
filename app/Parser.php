@@ -11,6 +11,7 @@ function _hotLoop(
     $buckets = \array_fill_keys($slugOrderList, '');
 
     $fh = \fopen($inputPath, 'rb');
+    \stream_set_read_buffer($fh, 0);
     \fseek($fh, $start);
     $remaining = $end - $start;
     $leftover = '';
@@ -88,7 +89,13 @@ final class Parser
     {
         \gc_disable();
 
-        $numWorkers = 10;
+        $perfCores = (int)\trim((string)@\shell_exec('sysctl -n hw.perflevel0.logicalcpu 2>/dev/null'));
+        if ($perfCores >= 4) {
+            $numWorkers = \max($perfCores, 6);
+        } else {
+            $ncpu = (int)\trim((string)@\shell_exec('sysctl -n hw.ncpu 2>/dev/null'));
+            $numWorkers = $ncpu >= 4 ? $ncpu : 10;
+        }
         $chunkSize  = 524288; // 512 KB
 
         // Change 4: Reduced slug sample (2MB instead of 4MB)
@@ -181,7 +188,7 @@ final class Parser
                 $len = \strlen($out);
                 $written = 0;
                 while ($written < $len) {
-                    $n = \fwrite($sock, \substr($out, $written, 65536));
+                    $n = \fwrite($sock, \substr($out, $written, 262144));
                     if ($n === false) break;
                     $written += $n;
                 }
@@ -222,7 +229,7 @@ final class Parser
             if (\stream_select($read, $write, $except, 1) > 0) {
                 foreach ($read as $sock) {
                     $w = $sockToW[(int)$sock];
-                    $data = \fread($sock, 131072);
+                    $data = \fread($sock, 2097152);
                     if ($data === '' || $data === false) {
                         \fclose($sock);
                         unset($activeSocks[$w]);
@@ -247,10 +254,10 @@ final class Parser
             $offset = 0;
             $dataLen = \strlen($data);
             while ($offset < $dataLen) {
-                ['idx' => $slugIdx, 'len' => $bucketLen] = \unpack('vidx/Vlen', $data, $offset);
+                $slugIdx = \ord($data[$offset]) | (\ord($data[$offset + 1]) << 8);
+                $bucketLen = \ord($data[$offset + 2]) | (\ord($data[$offset + 3]) << 8) | (\ord($data[$offset + 4]) << 16) | (\ord($data[$offset + 5]) << 24);
                 $offset += 6;
-                $slug = $slugOrderList[$slugIdx];
-                $mergedBuckets[$slug] .= \substr($data, $offset, $bucketLen);
+                $mergedBuckets[$slugOrderList[$slugIdx]] .= \substr($data, $offset, $bucketLen);
                 $offset += $bucketLen;
             }
         }
@@ -290,13 +297,14 @@ final class Parser
                     if ($packed === '') continue;
 
                     $counts = \array_count_values(\unpack('v*', $packed));
-                    \ksort($counts);
 
                     $fragment .= $separator . '    "\/blog\/' . $slug . '": {' . "\n";
                     $entrySep = '';
-                    foreach ($counts as $dId => $cnt) {
-                        $fragment .= $entrySep . '        "' . $idToDate[$dId] . '": ' . $cnt;
-                        $entrySep = ",\n";
+                    foreach ($idToDate as $dId => $dateStr) {
+                        if (isset($counts[$dId])) {
+                            $fragment .= $entrySep . '        "' . $dateStr . '": ' . $counts[$dId];
+                            $entrySep = ",\n";
+                        }
                     }
                     $fragment .= "\n    }";
                     $separator = ",\n";
@@ -306,7 +314,7 @@ final class Parser
                 $len = \strlen($fragment);
                 $written = 0;
                 while ($written < $len) {
-                    $n = \fwrite($sock, \substr($fragment, $written, 262144));
+                    $n = \fwrite($sock, \substr($fragment, $written, 524288));
                     if ($n === false) break;
                     $written += $n;
                 }
