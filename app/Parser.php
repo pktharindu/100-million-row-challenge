@@ -21,14 +21,12 @@ function _hotLoop(
         if ($raw === false || $raw === '') break;
         $remaining -= \strlen($raw);
 
-        // Handle boundary line from previous read (zero-copy: no $leftover.$raw concat)
         if ($leftover !== '') {
             $firstNl = \strpos($raw, "\n");
             if ($firstNl === false) {
                 $leftover .= $raw;
                 continue;
             }
-            // Complete the boundary line
             $line = $leftover . \substr($raw, 0, $firstNl);
             $lineLen = \strlen($line);
             $buckets[\substr($line, 25, $lineLen - 51)] .= $dateToId[\substr($line, $lineLen - 25, 10)];
@@ -38,7 +36,6 @@ function _hotLoop(
             $pos = 0;
         }
 
-        // Find last newline in $raw
         $lastNl = \strrpos($raw, "\n");
         if ($lastNl === false || $lastNl < $pos) {
             $leftover = ($pos > 0) ? \substr($raw, $pos) : $raw;
@@ -48,7 +45,6 @@ function _hotLoop(
 
         $fence = $lastNl - 720;
 
-        // 6x unrolled loop (operating on $raw instead of $chunk)
         while ($pos < $fence) {
             $nl = \strpos($raw, "\n", $pos + 52);
             $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 25, 10)];
@@ -75,7 +71,6 @@ function _hotLoop(
             $pos = $nl + 1;
         }
 
-        // Cleanup remainder
         while ($pos < $lastNl) {
             $nl = \strpos($raw, "\n", $pos + 52);
             if ($nl === false || $nl > $lastNl) break;
@@ -96,10 +91,10 @@ final class Parser
         $numWorkers = 10;
         $chunkSize  = 524288; // 512 KB
 
-        // Discover slugs from first 4 MB
+        // Change 4: Reduced slug sample (2MB instead of 4MB)
         $slugOrder = [];
         $fh = \fopen($inputPath, 'rb');
-        $sample = \fread($fh, 4194304);
+        $sample = \fread($fh, 2097152); // 2 MB
         \fclose($fh);
 
         $sampleLen = \strlen($sample);
@@ -116,7 +111,6 @@ final class Parser
         $slugOrderList = \array_keys($slugOrder);
         unset($sample, $slugOrder);
 
-        // Pre-enumerate dates (2019-2028, leap year aware)
         $dateToId = [];
         $idToDate = [];
         $dateId = 0;
@@ -135,7 +129,6 @@ final class Parser
             }
         }
 
-        // Partition file into equal segments aligned on line boundaries
         $fileSize = \filesize($inputPath);
         $segSize = (int)($fileSize / $numWorkers);
         $boundaries = [0];
@@ -148,17 +141,17 @@ final class Parser
         $boundaries[] = $fileSize;
         \fclose($fh);
 
-        // Build slug index for compact IPC
         $slugToIdx = \array_flip($slugOrderList);
 
-        // Create socket pairs before forking (one pair per child worker)
+        // Change 1: Large socket buffers via sockets extension (parsing workers)
         $sockets = [];
         for ($w = 0; $w < $numWorkers - 1; $w++) {
-            $pair = \stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
-            $sockets[$w] = $pair;
+            \socket_create_pair(AF_UNIX, SOCK_STREAM, 0, $rawPair);
+            \socket_set_option($rawPair[0], SOL_SOCKET, SO_RCVBUF, 2097152);
+            \socket_set_option($rawPair[1], SOL_SOCKET, SO_SNDBUF, 2097152);
+            $sockets[$w] = [\socket_export_stream($rawPair[0]), \socket_export_stream($rawPair[1])];
         }
 
-        // Fork workers with socket pair IPC
         $childPids = [];
 
         for ($w = 0; $w < $numWorkers - 1; $w++) {
@@ -193,7 +186,7 @@ final class Parser
                     $written += $n;
                 }
                 \fclose($sock);
-                \posix_kill(\posix_getpid(), 9); // fast exit: skip PHP shutdown
+                \posix_kill(\posix_getpid(), 9);
                 exit(0);
             }
             $childPids[] = $pid;
@@ -208,27 +201,31 @@ final class Parser
             $dateToId, $slugOrderList, $chunkSize
         );
 
-        $parentSocks = [];
+        // Change 2: Optimized drain loop with pre-built int-keyed map (no array_filter + array_search)
+        $sockToW = [];
+        $activeSocks = [];
         for ($w = 0; $w < $numWorkers - 1; $w++) {
             $parentSocks[$w] = $sockets[$w][0];
             \stream_set_blocking($parentSocks[$w], false);
+            $sockToW[(int)$parentSocks[$w]] = $w;
+            $activeSocks[$w] = $parentSocks[$w];
         }
 
         $buffers = \array_fill(0, $numWorkers - 1, '');
         $remaining = $numWorkers - 1;
 
         while ($remaining > 0) {
-            $read = \array_values(\array_filter($parentSocks, fn($s) => $s !== null));
+            $read = $activeSocks;
             if (empty($read)) break;
             $write = null;
             $except = null;
             if (\stream_select($read, $write, $except, 1) > 0) {
                 foreach ($read as $sock) {
-                    $w = \array_search($sock, $parentSocks, true);
-                    $data = \fread($sock, 65536);
+                    $w = $sockToW[(int)$sock];
+                    $data = \fread($sock, 131072);
                     if ($data === '' || $data === false) {
                         \fclose($sock);
-                        $parentSocks[$w] = null;
+                        unset($activeSocks[$w]);
                         $remaining--;
                     } else {
                         $buffers[$w] .= $data;
@@ -258,14 +255,17 @@ final class Parser
             }
         }
 
-        // Parallel batch count + JSON output using forked counting workers
         $numCounters = 8;
         $numSlugs = \count($slugOrderList);
         $slugsPerCounter = (int)\ceil($numSlugs / $numCounters);
 
+        // Change 1: Large socket buffers via sockets extension (counting workers)
         $countPipes = [];
         for ($c = 0; $c < $numCounters; $c++) {
-            $countPipes[$c] = \stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+            \socket_create_pair(AF_UNIX, SOCK_STREAM, 0, $rawPair);
+            \socket_set_option($rawPair[0], SOL_SOCKET, SO_RCVBUF, 2097152);
+            \socket_set_option($rawPair[1], SOL_SOCKET, SO_SNDBUF, 2097152);
+            $countPipes[$c] = [\socket_export_stream($rawPair[0]), \socket_export_stream($rawPair[1])];
         }
 
         $countPids = [];
@@ -280,6 +280,7 @@ final class Parser
                 $myStart = $c * $slugsPerCounter;
                 $myEnd = \min(($c + 1) * $slugsPerCounter, $numSlugs);
 
+                // Change 3: Inline JSON building with direct string concat (no entries array + implode)
                 $fragment = '';
                 $separator = '';
 
@@ -291,13 +292,13 @@ final class Parser
                     $counts = \array_count_values(\unpack('v*', $packed));
                     \ksort($counts);
 
-                    $entries = [];
+                    $fragment .= $separator . '    "\/blog\/' . $slug . '": {' . "\n";
+                    $entrySep = '';
                     foreach ($counts as $dId => $cnt) {
-                        $entries[] = '        "' . $idToDate[$dId] . '": ' . $cnt;
+                        $fragment .= $entrySep . '        "' . $idToDate[$dId] . '": ' . $cnt;
+                        $entrySep = ",\n";
                     }
-
-                    $fragment .= $separator . '    "\/blog\/' . $slug . '": {' . "\n"
-                               . \implode(",\n", $entries) . "\n    }";
+                    $fragment .= "\n    }";
                     $separator = ",\n";
                 }
 
@@ -310,7 +311,7 @@ final class Parser
                     $written += $n;
                 }
                 \fclose($sock);
-                \posix_kill(\posix_getpid(), 9); // fast exit: skip PHP shutdown
+                \posix_kill(\posix_getpid(), 9);
                 exit(0);
             }
             $countPids[] = $pid;
