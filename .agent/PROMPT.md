@@ -64,7 +64,22 @@ data/test-data-expected.json
 **Input format:** `https://stitcher.io/blog/{slug},{YYYY}-{MM}-{DD}T{HH}:{MM}:{SS}+00:00\n`
 - URL prefix: always 25 bytes (`https://stitcher.io/blog/`)
 - Timestamp after comma: always 25 bytes
-- Date extraction: 8 chars at `commaPos + 3` gives `YY-MM-DD` (skip century `20`)
+- Date extraction: 8 chars at `commaPos + 3` gives chars [2..9] of the YYYY-MM-DD (strips century digits)
+
+**Data generation rules — the parser MUST handle ALL of these:**
+- Default: `php tempest data:generate 100_000_000` uses `seed=1`. With seed=1, `$now=1` (Unix epoch Jan 1 1970), dates span a 5-year window backwards → **years 1965–1969**. NOT 2020–2027.
+- `--no-seed`: uses `time()` as base → dates span ~5 years back from current time (e.g., 2021–2026 if run in 2026).
+- `--seed=N`: uses N as the base timestamp → dates span 5 years back from epoch N.
+- **The real benchmark dataset was generated WITHOUT a seed and is secret.** Its date range is unknown.
+- **The parser must work with ANY valid date range.** Do NOT hardcode year ranges. Discover the date range dynamically from the input data.
+
+**KNOWN BUG (must be fixed):** The current Parser.php hardcodes date lookup to years 2019–2028. This fails on the seed=1 dataset (1965–1969) and would fail on any dataset outside that range. The date table generation MUST be dynamic — sample the file to discover the actual year range, then build the lookup table accordingly.
+
+**Local testing datasets:**
+- `data/data.csv` — currently 100M rows (seed=1, years 1965–1969, ~7.5GB). Generated via `php tempest data:generate 100_000_000`.
+- `data/test-data.csv` — small validation set with expected output.
+- To regenerate 10M rows: `php tempest data:generate 10_000_000`
+- To test with a different date range: `php tempest data:generate 10_000_000 --seed=1709251200` (generates ~2019-2024 dates)
 
 ---
 
@@ -176,12 +191,19 @@ Skip any candidates the subagent reported as FAIL in verification. For each rema
    ```
    If validation fails or times out → INVALID, restore baseline, move to next.
 
-3. **Full-data smoke test (10M rows):**
+3. **Full-data smoke test:**
    ```bash
-   timeout 120 php tempest data:parse
+   timeout 300 php tempest data:parse
    ```
-   This catches errors that only appear at scale — fork crashes, chunk boundary bugs, memory issues, segfaults. The subagents already tested with the small test dataset but `data/data.csv` (10M rows) is gitignored and wasn't available in their worktrees.
+   `data/data.csv` is currently **100M rows (~7.5GB, seed=1, years 1965–1969)**. This catches:
+   - Errors that only appear at scale (fork crashes, chunk boundary bugs, memory issues, segfaults)
+   - **Date range bugs** — the seed=1 dataset has years 1965–1969, NOT 2020–2027. Any hardcoded date range will fail here.
+   - Memory pressure at 100M scale that doesn't exist at 10M
+   
+   The subagents test with the small test dataset only (the full data is gitignored and not in worktrees).
    If this errors out or times out → INVALID, restore baseline, move to next.
+   
+   **Note:** 100M rows takes significantly longer (~1.5–4s depending on architecture). Adjust timeout accordingly.
 
 4. **Benchmark** (only if both checks passed):
    ```bash

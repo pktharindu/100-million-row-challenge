@@ -158,7 +158,7 @@ Wall-clock includes ~273ms PHP+Tempest overhead that is UNOPTIMIZABLE.
 - macOS, M4 Pro, 14 logical CPUs (10 perf + 4 efficiency)
 - shmmax: 4MB, shmall: 1024 pages (4MB total), shmseg: 8
 - kern.ipc.maxsockbuf: 8MB
-- data.csv: 750,949,374 bytes (~751MB, 10M rows)
+- data.csv: **100M rows** (~7.5GB, seed=1, years 1965–1969). Generated via `php tempest data:generate 100_000_000`
 - hyperfine available
 - sys_get_temp_dir() = /var/folders/zh/yjg3m2ln2xq_7qcxnh175gd80000gn/T (macOS app sandbox)
 - Profiled iter11 phases: sysctl=5.3ms (eliminated via cache), setup_total=6.7ms→1.5ms, prefork=3.7ms, hotloop=99ms, drain=10ms, count=22ms
@@ -170,12 +170,28 @@ Wall-clock includes ~273ms PHP+Tempest overhead that is UNOPTIMIZABLE.
 - **IMPORTANT (iter13): PHP output buffer (ob_start+echo) has NO measurable advantage over `.=` string concatenation for this workload. Both use C-level internal buffers with exponential growth.**
 - **IMPORTANT (iter13): strlen() is O(1) via zend_string header — caching in a variable is pointless.**
 
-## COMPLETE Assessment (iter13)
-- **3 consecutive iterations with 0% improvement** (8, 12, 13) — iter8 was pre-major-optimization, but iters 12-13 are post-plateau
-- **All optimization categories exhausted** at 10M scale:
-  - Hot loop: at interpreter floor (~120ns/row, 72% of parser time)
-  - Counting phase: C-level operations dominate, all PHP-level optimizations tested
-  - IPC: socket buffers optimal, all alternatives tested and regressed
-  - Setup: fully cached and pre-computed
-- **Only remaining opportunity (flat 1D arrays) cannot be validated locally** — would regress 10M by ~100ms but save ~150ms at 100M
-- **Recommendation: COMPLETE for 10M-testable optimizations.** If 100M testing becomes available, flat 1D architecture is the clear next step.
+## KNOWN BUG (HUMAN-DIRECTED — MUST FIX BEFORE ANYTHING ELSE)
+
+**The date lookup table is hardcoded to years 2019–2028.** The current code has:
+```php
+for ($year = 2019; $year <= 2028; $year++) { ... }
+```
+This FAILS on the seed=1 dataset (years 1965–1969) with `Undefined array key "65-01-15"` errors.
+
+**Fix:** Sample the first ~4KB of the input file to discover the actual year range, then build the date table dynamically. The 8-char key approach (strip century) still works — the generator uses a 5-year window so century collisions don't occur.
+
+**This must be the FIRST thing fixed in iteration 14.** Nothing else matters if the parser crashes on the benchmark data.
+
+## COMPLETE Assessment — RESCINDED (HUMAN-DIRECTED — DO NOT OVERWRITE)
+
+Previous COMPLETE assessment is **void**. New context:
+1. **100M dataset is now available locally** (`data/data.csv`, ~7.5GB, seed=1, years 1965–1969). The parser currently CRASHES on it.
+2. **The hardcoded date range bug must be fixed first.**
+3. **After fixing, benchmark at 100M scale.** The flat 1D array architecture (like top leaderboard entries) should now be testable — it was rejected at 10M but is expected to win at 100M.
+4. **Re-profile at 100M** — bottleneck distribution may shift (IPC becomes larger, hot loop stays proportional, counting phase changes with higher collision rates).
+
+**Priority for iteration 14:**
+1. Fix the date range bug (dynamic year discovery)
+2. Verify parser works on 100M dataset
+3. Benchmark at 100M with parser-reported time
+4. Consider flat 1D array architecture now that 100M testing is possible
