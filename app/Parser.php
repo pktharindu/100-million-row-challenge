@@ -30,7 +30,8 @@ function _hotLoop(
             }
             $line = $leftover . \substr($raw, 0, $firstNl);
             $lineLen = \strlen($line);
-            $buckets[\substr($line, 25, $lineLen - 51)] .= $dateToId[\substr($line, $lineLen - 25, 10)];
+            // Change 4: extract 8-char date key "YY-MM-DD" (skip "20" prefix)
+            $buckets[\substr($line, 25, $lineLen - 51)] .= $dateToId[\substr($line, $lineLen - 23, 8)];
             $leftover = '';
             $pos = $firstNl + 1;
         } else {
@@ -44,38 +45,41 @@ function _hotLoop(
         }
         $leftover = ($lastNl + 1 < \strlen($raw)) ? \substr($raw, $lastNl + 1) : '';
 
-        $fence = $lastNl - 720;
+        // Change 6: tighten fence from 720 to 600 (max line 99 bytes; 6 × 100 = 600)
+        $fence = $lastNl - 600;
 
         while ($pos < $fence) {
             $nl = \strpos($raw, "\n", $pos + 52);
-            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 25, 10)];
+            // Change 2: extract 8-char date key "YY-MM-DD" (nl - 23, length 8)
+            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
             $pos = $nl + 1;
 
             $nl = \strpos($raw, "\n", $pos + 52);
-            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 25, 10)];
+            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
             $pos = $nl + 1;
 
             $nl = \strpos($raw, "\n", $pos + 52);
-            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 25, 10)];
+            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
             $pos = $nl + 1;
 
             $nl = \strpos($raw, "\n", $pos + 52);
-            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 25, 10)];
+            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
             $pos = $nl + 1;
 
             $nl = \strpos($raw, "\n", $pos + 52);
-            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 25, 10)];
+            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
             $pos = $nl + 1;
 
             $nl = \strpos($raw, "\n", $pos + 52);
-            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 25, 10)];
+            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
             $pos = $nl + 1;
         }
 
+        // Change 3 (tail): extract 8-char date key "YY-MM-DD"
         while ($pos < $lastNl) {
             $nl = \strpos($raw, "\n", $pos + 52);
             if ($nl === false || $nl > $lastNl) break;
-            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 25, 10)];
+            $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
             $pos = $nl + 1;
         }
     }
@@ -98,10 +102,10 @@ final class Parser
         }
         $chunkSize  = 524288; // 512 KB
 
-        // Change 4: Reduced slug sample (2MB instead of 4MB)
+        // Change 5: Reduced slug sample from 2MB to 512KB
         $slugOrder = [];
         $fh = \fopen($inputPath, 'rb');
-        $sample = \fread($fh, 2097152); // 2 MB
+        $sample = \fread($fh, 524288); // 512 KB
         \fclose($fh);
 
         $sampleLen = \strlen($sample);
@@ -118,6 +122,7 @@ final class Parser
         $slugOrderList = \array_keys($slugOrder);
         unset($sample, $slugOrder);
 
+        // Change 1: dateToId uses 8-char "YY-MM-DD" key; idToDate keeps full "YYYY-MM-DD" for JSON output
         $dateToId = [];
         $idToDate = [];
         $dateId = 0;
@@ -128,9 +133,10 @@ final class Parser
                 $days = $daysInMonth[$month];
                 if ($month === 2 && $isLeap) $days = 29;
                 for ($day = 1; $day <= $days; $day++) {
-                    $dateStr = \sprintf('%04d-%02d-%02d', $year, $month, $day);
-                    $dateToId[$dateStr] = \chr($dateId & 0xFF) . \chr($dateId >> 8);
-                    $idToDate[$dateId] = $dateStr;
+                    $yy = $year - 2000;
+                    $dateStr8 = ($yy < 10 ? '0' : '') . $yy . '-' . ($month < 10 ? '0' : '') . $month . '-' . ($day < 10 ? '0' : '') . $day;
+                    $dateToId[$dateStr8] = \chr($dateId & 0xFF) . \chr($dateId >> 8);
+                    $idToDate[$dateId] = \sprintf('%04d-%02d-%02d', $year, $month, $day);
                     $dateId++;
                 }
             }
@@ -150,7 +156,7 @@ final class Parser
 
         $slugToIdx = \array_flip($slugOrderList);
 
-        // Change 1: Large socket buffers via sockets extension (parsing workers)
+        // Large socket buffers via sockets extension (parsing workers)
         $sockets = [];
         for ($w = 0; $w < $numWorkers - 1; $w++) {
             \socket_create_pair(AF_UNIX, SOCK_STREAM, 0, $rawPair);
@@ -235,7 +241,7 @@ final class Parser
         $numSlugs = \count($slugOrderList);
         $slugsPerCounter = (int)\ceil($numSlugs / $numCounters);
 
-        // Change 1: Large socket buffers via sockets extension (counting workers)
+        // Large socket buffers via sockets extension (counting workers)
         $countPipes = [];
         for ($c = 0; $c < $numCounters; $c++) {
             \socket_create_pair(AF_UNIX, SOCK_STREAM, 0, $rawPair);
@@ -256,7 +262,6 @@ final class Parser
                 $myStart = $c * $slugsPerCounter;
                 $myEnd = \min(($c + 1) * $slugsPerCounter, $numSlugs);
 
-                // Change 3: Inline JSON building with direct string concat (no entries array + implode)
                 $fragment = '';
                 $separator = '';
 
