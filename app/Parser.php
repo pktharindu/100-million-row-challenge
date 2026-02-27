@@ -252,31 +252,92 @@ final class Parser
             }
         }
 
-        // Fused batch count + JSON output (single pass per slug for cache locality)
-        $bufferSize = 65536;
-        $fhOut = \fopen($outputPath, 'wb');
-        $buf = "{\n";
-        $separator = '';
-        foreach ($slugOrderList as $slug) {
-            $packed = $mergedBuckets[$slug];
-            if ($packed === '') continue;
-            $counts = \array_count_values(\unpack('v*', $packed));
-            \ksort($counts);
-            $entries = [];
-            foreach ($counts as $dId => $cnt) {
-                $entries[] = '        "' . $idToDate[$dId] . '": ' . $cnt;
+        // Parallel batch count + JSON output using forked counting workers
+        $numCounters = 4;
+        $numSlugs = \count($slugOrderList);
+        $slugsPerCounter = (int)\ceil($numSlugs / $numCounters);
+
+        // Create pipe pairs for counting workers
+        $countPipes = [];
+        for ($c = 0; $c < $numCounters; $c++) {
+            $countPipes[$c] = \stream_socket_pair(STREAM_PF_UNIX, STREAM_SOCK_STREAM, STREAM_IPPROTO_IP);
+        }
+
+        $countPids = [];
+        for ($c = 0; $c < $numCounters; $c++) {
+            $pid = \pcntl_fork();
+            if ($pid === 0) {
+                // Child: close parent ends and sibling child ends
+                for ($i = 0; $i < $numCounters; $i++) {
+                    \fclose($countPipes[$i][0]);
+                    if ($i !== $c) \fclose($countPipes[$i][1]);
+                }
+
+                $myStart = $c * $slugsPerCounter;
+                $myEnd = \min(($c + 1) * $slugsPerCounter, $numSlugs);
+
+                $fragment = '';
+                $separator = '';
+
+                for ($s = $myStart; $s < $myEnd; $s++) {
+                    $slug = $slugOrderList[$s];
+                    $packed = $mergedBuckets[$slug];
+                    if ($packed === '') continue;
+
+                    $counts = \array_count_values(\unpack('v*', $packed));
+                    \ksort($counts);
+
+                    $entries = [];
+                    foreach ($counts as $dId => $cnt) {
+                        $entries[] = '        "' . $idToDate[$dId] . '": ' . $cnt;
+                    }
+
+                    $fragment .= $separator . '    "\/blog\/' . $slug . '": {' . "\n"
+                               . \implode(",\n", $entries) . "\n    }";
+                    $separator = ",\n";
+                }
+
+                $sock = $countPipes[$c][1];
+                $len = \strlen($fragment);
+                $written = 0;
+                while ($written < $len) {
+                    $n = \fwrite($sock, \substr($fragment, $written, 262144));
+                    if ($n === false) break;
+                    $written += $n;
+                }
+                \fclose($sock);
+                exit(0);
             }
-            $buf .= $separator . '    "\/blog\/' . $slug . '": {' . "\n"
-                  . \implode(",\n", $entries) . "\n    }";
-            $separator = ",\n";
-            if (\strlen($buf) >= $bufferSize) {
-                \fwrite($fhOut, $buf);
-                $buf = '';
-            }
+            $countPids[] = $pid;
+        }
+
+        // Parent: close child ends
+        for ($c = 0; $c < $numCounters; $c++) {
+            \fclose($countPipes[$c][1]);
         }
         unset($mergedBuckets);
-        $buf .= "\n}";
-        \fwrite($fhOut, $buf);
+
+        // Read fragments in order and write output
+        $fhOut = \fopen($outputPath, 'wb');
+        \fwrite($fhOut, "{\n");
+        $needSep = false;
+
+        for ($c = 0; $c < $numCounters; $c++) {
+            $fragment = \stream_get_contents($countPipes[$c][0]);
+            \fclose($countPipes[$c][0]);
+
+            if ($fragment !== '') {
+                if ($needSep) \fwrite($fhOut, ",\n");
+                \fwrite($fhOut, $fragment);
+                $needSep = true;
+            }
+        }
+
+        \fwrite($fhOut, "\n}");
         \fclose($fhOut);
+
+        foreach ($countPids as $pid) {
+            \pcntl_waitpid($pid, $status);
+        }
     }
 }
