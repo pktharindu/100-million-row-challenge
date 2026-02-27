@@ -55,7 +55,7 @@ The parser processes CSV lines of format:
 - Minimum line length is 52 bytes (25 prefix + 1 slug char + 1 comma + 25 timestamp)
 - Available extensions include: pcntl, shmop, sysvsem, sysvshm, igbinary, sockets
 
-## Important performance notes (from iteration 2-5 experiments)
+## Important performance notes (from iteration 2-7 experiments)
 
 - **NEVER move unpack+array_count_values to child parsing workers at 10M scale.** At 10M rows, the counted format (4 bytes per unique date-count pair) is LARGER than raw bucket format (2 bytes per visit) because the date collision rate is only ~1.01x. This causes a massive regression. Would only help at 100M scale where collision rate is ~10x.
 - **512KB read chunks with zero-copy are optimal.** The hot loop now processes $raw directly (no $leftover.$raw concatenation).
@@ -72,6 +72,11 @@ The parser processes CSV lines of format:
 - **Child workers use posix_kill(SIGKILL) for fast exit** — skips PHP shutdown overhead (~17ms saved). Place AFTER fclose($sock) to ensure data is flushed.
 - **JSON generation MUST be parallel** — single-threaded JSON for 270 slugs × 3000+ dates takes ~90ms. With 8 parallel workers it's ~22ms. NEVER move JSON generation to a single thread.
 - **The hot loop is near PHP's interpreter floor** at ~120ns/row.
+- **stream_set_read_buffer($fh, 0) is CRITICAL** — PHP's default 8KB read buffer causes double-buffering with large fread() calls. Disabling it gave a 38% system-time reduction. ALWAYS include this after fopen() in hot loop workers.
+- **Drain fread should be 2MB (matching SO_RCVBUF)** — reads entire child payload in one syscall. Do not use smaller buffers.
+- **Child write chunks should be ≥256KB** — With 2MB SO_SNDBUF, writing in 64KB chunks wastes syscalls. Use 262144 for parsing workers, 524288 for counting workers.
+- **Worker count is now adaptive** — uses `sysctl -n hw.perflevel0.logicalcpu` to detect Apple Silicon performance cores. max(perflevel0, 6). On M4 Pro: 10, on M1: 6.
+- **Counting workers use idToDate iteration (not ksort)** — since date IDs are chronological, iterating $idToDate and checking isset($counts[$dId]) produces sorted output without ksort().
 
 ## Response format
 
