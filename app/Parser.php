@@ -109,7 +109,7 @@ final class Parser
             @\file_put_contents($cpuCacheFile, (string)$perfCores);
         }
         $numWorkers = ($perfCores >= 8) ? $perfCores : 12;
-        $chunkSize  = 524288; // 512 KB
+        $chunkSize  = ($perfCores >= 8) ? 524288 : 163840;
 
         $slugOrder = [];
         $fh = \fopen($inputPath, 'rb');
@@ -228,7 +228,7 @@ final class Parser
             $drained++;
         } while ($drained < $numWorkers);
 
-        $numCounters = 10;
+        $numCounters = ($perfCores >= 8) ? 10 : 8;
         $numSlugs = \count($slugOrderList);
         $slugsPerCounter = (int)\ceil($numSlugs / $numCounters);
 
