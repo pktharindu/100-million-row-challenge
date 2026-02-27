@@ -133,8 +133,10 @@ Each `parser-optimizer` subagent:
 - Uses **Sonnet** (`model: sonnet`) — fast and cost-effective for focused code changes
 - Has `bypassPermissions` so it doesn't stall on prompts
 - Modifies ONLY `app/Parser.php` in its worktree
-- Does NOT run benchmarks — returns what it changed and why
+- **Self-verifies:** runs `data:validate` AND a `data:parse` smoke test against the test dataset before reporting back. This catches fork bugs, chunk boundary issues, and runtime errors early — before you spend time benchmarking broken code.
+- Does NOT run performance benchmarks — returns what it changed, verification results, and why
 - Worktree auto-cleans if the subagent makes no changes
+- **Note:** Subagents can only verify against the small test dataset (the full 10M-row `data/data.csv` is gitignored and not in the worktree). Errors that only manifest at scale (memory, large chunk edge cases) are caught in Phase 5 when YOU run `data:parse` with the full dataset.
 
 **You (Opus) handle:** analysis, experiment design, benchmark evaluation, knowledge base evolution, and architectural decisions. Delegate implementation to the Sonnet subagents.
 
@@ -154,28 +156,35 @@ If you can't determine the worktree paths, have each subagent `cat app/Parser.ph
 
 **CRITICAL: Only ONE benchmark runs at a time.** Parallel benchmarks contaminate each other's results.
 
-For each candidate:
+Skip any candidates the subagent reported as FAIL in verification. For each remaining candidate:
 
 1. **Install the candidate:**
    ```bash
    cp .agent/checkpoints/candidate-A.php app/Parser.php
    ```
 
-2. **Validate:**
+2. **Validate (small test data):**
    ```bash
    timeout 30 php tempest data:validate
    ```
-   If validation fails or times out → mark this candidate as INVALID, restore baseline, move to next.
+   If validation fails or times out → INVALID, restore baseline, move to next.
 
-3. **Benchmark** (only if validation passed):
+3. **Full-data smoke test (10M rows):**
+   ```bash
+   timeout 120 php tempest data:parse
+   ```
+   This catches errors that only appear at scale — fork crashes, chunk boundary bugs, memory issues, segfaults. The subagents already tested with the small test dataset but `data/data.csv` (10M rows) is gitignored and wasn't available in their worktrees.
+   If this errors out or times out → INVALID, restore baseline, move to next.
+
+4. **Benchmark** (only if both checks passed):
    ```bash
    hyperfine --warmup 2 --runs 7 'php tempest data:parse'
    ```
    If `hyperfine` is unavailable, run manually with 5 runs, discard best/worst, take median of middle 3.
 
-4. **Record results** for this candidate: median time, variance, pass/fail.
+5. **Record results** for this candidate: median time, variance, pass/fail.
 
-5. **Restore baseline** before testing next candidate:
+6. **Restore baseline** before testing next candidate:
    ```bash
    git checkout -- app/Parser.php
    ```
