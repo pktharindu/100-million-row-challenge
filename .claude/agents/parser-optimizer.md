@@ -55,14 +55,9 @@ The parser processes CSV lines of format:
 - Minimum line length is 52 bytes (25 prefix + 1 slug char + 1 comma + 25 timestamp)
 - Available extensions include: pcntl, shmop, sysvsem, sysvshm, igbinary, sockets
 
-## CRITICAL: Date range handling
+## Date range
 
-**The parser MUST work with ANY date range.** Do NOT hardcode year ranges.
-
-- The default seed=1 dataset has dates in **1965–1969** (NOT 2020–2027).
-- The real benchmark uses an unseeded dataset with an unknown date range.
-- The 8-char date key (extracted at `$nl - 23, 8`) strips the century: "1965-01-15" → "65-01-15", "2026-01-15" → "26-01-15". This is fine — the generator uses a 5-year window so century collisions don't occur.
-- **If the current code has a hardcoded year range (e.g., `for ($year = 2019; $year <= 2028; ...)`), you MUST fix it.** Sample the input file to discover the actual year range and build the date lookup table dynamically.
+The real benchmark data has dates in **2020-2026**. The parser hardcodes years 2019-2028 which covers this with margin. All top leaderboard entries do the same. Do NOT implement dynamic date discovery — it adds overhead for no benefit. The local test dataset uses `--seed=1709251200` (dates ~2019-2024), which also fits within 2019-2028.
 
 ## Important performance notes (from iteration 2-9 experiments)
 

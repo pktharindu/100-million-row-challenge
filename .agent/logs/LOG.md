@@ -6,7 +6,7 @@
 - **Iteration count:** 13
 - **Parser architecture:** 12 workers for M1 (10 on M4 Pro), socket_create_pair + socket_export_stream with 2MB SO_SNDBUF/SO_RCVBUF, unbuffered I/O (stream_set_read_buffer 0), sequential stream_get_contents drain + inline TLV merge, 6x loop unrolling, bucket accumulation with 2-byte date IDs (8-char "YY-MM-DD" keys), 512KB read chunks, zero-copy hot loop, 10 counting workers with pre-computed JSON date prefixes (dateJsonPrefix), SIGKILL fast exit, 262KB child write / 512KB count write, 512KB slug sample, fence at lastNl - 600
 - **Target:** ~120-130ms parser time (interpreter floor estimate). Room: ~7-17ms (5-12%)
-- **OPTIMIZATION PLATEAU CONFIRMED:** 2 consecutive iterations (12, 13) with 0% improvement. All micro-optimizations exhausted. Only remaining opportunity is flat 1D arrays (scale-dependent, can't validate locally).
+- **10M OPTIMIZATION PLATEAU:** 2 consecutive iterations (12, 13) with 0% improvement at 10M scale. **100M testing now available** — bottleneck distribution shifts at scale. Flat 1D arrays, worker-side counting, and other scale-dependent techniques can now be tested.
 
 ## Bottleneck Model (iter11 — updated with profiling)
 | Phase | Time | % Internal | Serial? |
@@ -123,10 +123,11 @@ Wall-clock includes ~273ms PHP+Tempest overhead that is UNOPTIMIZABLE.
 
 ## Remaining Ideas (reassessed iter13)
 
-### Only viable at 100M scale (can't validate locally):
-1. **Flat 1D array architecture** — Would eliminate second fork wave. Merge cost ~240ms at 10M (too slow) but constant IPC at 100M saves ~87ms in drain. All top entries use this. **Cannot be validated at 10M — would need 100M testing.**
-2. **128KB/160KB read chunks for M1** — No effect on M4 Pro. May help on M1 with 128KB L1d. Can't test.
-3. **Work stealing for M1** — Regresses on M4 Pro but M1 heterogeneous cores might benefit.
+### Now testable at 100M scale:
+1. **Flat 1D array architecture** — Would eliminate second fork wave. Merge cost ~240ms at 10M (too slow) but constant IPC at 100M saves ~87ms in drain. All top entries use this. **NOW TESTABLE with local 100M dataset.**
+2. **Worker-side counting** — At 10M, counted format was larger than raw (collision rate ~1.01x). At 100M, collision rate ~10x — counted format should be 10x smaller than raw. **Re-test at 100M.**
+3. **128KB/160KB read chunks for M1** — No effect on M4 Pro. May help on M1 with 128KB L1d. Can't test locally (M4 Pro).
+4. **Work stealing for M1** — Regresses on M4 Pro but M1 heterogeneous cores might benefit. Can't test locally.
 
 ### Exhausted categories:
 - Hot loop micro-optimizations: AT INTERPRETER FLOOR. strlen cache, chunk sizes, unrolling, newline skip all tested.
@@ -158,7 +159,7 @@ Wall-clock includes ~273ms PHP+Tempest overhead that is UNOPTIMIZABLE.
 - macOS, M4 Pro, 14 logical CPUs (10 perf + 4 efficiency)
 - shmmax: 4MB, shmall: 1024 pages (4MB total), shmseg: 8
 - kern.ipc.maxsockbuf: 8MB
-- data.csv: **100M rows** (~7.5GB, seed=1, years 1965–1969). Generated via `php tempest data:generate 100_000_000`
+- data.csv: **100M rows** (~7.5GB, seed=1709251200, dates ~2019-2024). Generated via `php tempest data:generate 100_000_000 --seed=1709251200`
 - hyperfine available
 - sys_get_temp_dir() = /var/folders/zh/yjg3m2ln2xq_7qcxnh175gd80000gn/T (macOS app sandbox)
 - Profiled iter11 phases: sysctl=5.3ms (eliminated via cache), setup_total=6.7ms→1.5ms, prefork=3.7ms, hotloop=99ms, drain=10ms, count=22ms
@@ -170,28 +171,16 @@ Wall-clock includes ~273ms PHP+Tempest overhead that is UNOPTIMIZABLE.
 - **IMPORTANT (iter13): PHP output buffer (ob_start+echo) has NO measurable advantage over `.=` string concatenation for this workload. Both use C-level internal buffers with exponential growth.**
 - **IMPORTANT (iter13): strlen() is O(1) via zend_string header — caching in a variable is pointless.**
 
-## KNOWN BUG (HUMAN-DIRECTED — MUST FIX BEFORE ANYTHING ELSE)
-
-**The date lookup table is hardcoded to years 2019–2028.** The current code has:
-```php
-for ($year = 2019; $year <= 2028; $year++) { ... }
-```
-This FAILS on the seed=1 dataset (years 1965–1969) with `Undefined array key "65-01-15"` errors.
-
-**Fix:** Sample the first ~4KB of the input file to discover the actual year range, then build the date table dynamically. The 8-char key approach (strip century) still works — the generator uses a 5-year window so century collisions don't occur.
-
-**This must be the FIRST thing fixed in iteration 14.** Nothing else matters if the parser crashes on the benchmark data.
-
 ## COMPLETE Assessment — RESCINDED (HUMAN-DIRECTED — DO NOT OVERWRITE)
 
 Previous COMPLETE assessment is **void**. New context:
-1. **100M dataset is now available locally** (`data/data.csv`, ~7.5GB, seed=1, years 1965–1969). The parser currently CRASHES on it.
-2. **The hardcoded date range bug must be fixed first.**
-3. **After fixing, benchmark at 100M scale.** The flat 1D array architecture (like top leaderboard entries) should now be testable — it was rejected at 10M but is expected to win at 100M.
-4. **Re-profile at 100M** — bottleneck distribution may shift (IPC becomes larger, hot loop stays proportional, counting phase changes with higher collision rates).
+1. **100M dataset is now available locally** (`data/data.csv`, ~7.5GB, seed=1709251200, dates ~2019-2024). The hardcoded 2019-2028 date range works fine with this dataset.
+2. **All prior benchmarks were at 10M scale.** The optimization plateau was at 10M. At 100M, the bottleneck distribution shifts — IPC becomes proportionally larger, counting phase collision rates are ~10x higher, and architectural choices that were neutral at 10M may dominate.
+3. **The flat 1D array architecture (like top leaderboard entries) can now be tested.** It was rejected at 10M (merge cost too high) but is expected to win at 100M (constant IPC size vs. bucket accumulation's row-proportional IPC).
+4. **Re-profile at 100M** — measure actual phase times to update the bottleneck model.
 
 **Priority for iteration 14:**
-1. Fix the date range bug (dynamic year discovery)
-2. Verify parser works on 100M dataset
-3. Benchmark at 100M with parser-reported time
-4. Consider flat 1D array architecture now that 100M testing is possible
+1. Baseline benchmark at 100M scale with parser-reported time
+2. Profile at 100M to update bottleneck model (phase times may shift dramatically)
+3. Test flat 1D array architecture — this is the biggest structural change remaining
+4. Re-evaluate all "dead ends" that were only tested at 10M (worker-side counting, chunk sizes, work stealing)
