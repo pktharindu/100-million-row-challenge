@@ -14,36 +14,24 @@ function _hotLoop(
     \stream_set_read_buffer($fh, 0);
     \fseek($fh, $start);
     $remaining = $end - $start;
-    $leftover = '';
 
-    do {
-        $toRead = \min($chunkSize, $remaining);
+    while ($remaining > 0) {
+        $toRead = $remaining > $chunkSize ? $chunkSize : $remaining;
         $raw = \fread($fh, $toRead);
         if ($raw === false || $raw === '') break;
-        $remaining -= \strlen($raw);
-
-        if ($leftover !== '') {
-            $firstNl = \strpos($raw, "\n");
-            if ($firstNl === false) {
-                $leftover .= $raw;
-                continue;
-            }
-            $line = $leftover . \substr($raw, 0, $firstNl);
-            $lineLen = \strlen($line);
-            $buckets[\substr($line, 25, $lineLen - 51)] .= $dateToId[\substr($line, $lineLen - 23, 8)];
-            $leftover = '';
-            $pos = $firstNl + 1;
-        } else {
-            $pos = 0;
-        }
+        $rawLen = \strlen($raw);
+        $remaining -= $rawLen;
 
         $lastNl = \strrpos($raw, "\n");
-        if ($lastNl === false || $lastNl < $pos) {
-            $leftover = ($pos > 0) ? \substr($raw, $pos) : $raw;
-            continue;
-        }
-        $leftover = ($lastNl + 1 < \strlen($raw)) ? \substr($raw, $lastNl + 1) : '';
+        if ($lastNl === false) break;
 
+        $tail = $rawLen - $lastNl - 1;
+        if ($tail > 0) {
+            \fseek($fh, -$tail, SEEK_CUR);
+            $remaining += $tail;
+        }
+
+        $pos = 0;
         $fence = $lastNl - 600;
 
         if ($pos < $fence) {
@@ -82,7 +70,7 @@ function _hotLoop(
                 $pos = $nl + 1;
             } while ($pos < $lastNl);
         }
-    } while ($remaining > 0);
+    }
     \fclose($fh);
     return $buckets;
 }
@@ -91,12 +79,11 @@ final class Parser
 {
     public function parse(string $inputPath, string $outputPath): void
     {
-        \gc_disable();
-
         $numWorkers = 10;
         $chunkSize  = 131072;
 
-        $slugOrder = [];
+        $slugToIdx = [];
+        $slugCount = 0;
         $fh = \fopen($inputPath, 'rb');
         $sample = \fread($fh, 524288);
         \fclose($fh);
@@ -107,13 +94,13 @@ final class Parser
             $nl = \strpos($sample, "\n", $sPos + 52);
             if ($nl === false) break;
             $slug = \substr($sample, $sPos + 25, $nl - $sPos - 51);
-            if (!isset($slugOrder[$slug])) {
-                $slugOrder[$slug] = true;
+            if (!isset($slugToIdx[$slug])) {
+                $slugToIdx[$slug] = $slugCount++;
             }
             $sPos = $nl + 1;
         }
-        $slugOrderList = \array_keys($slugOrder);
-        unset($sample, $slugOrder);
+        $slugOrderList = \array_keys($slugToIdx);
+        unset($sample);
 
         $dateToId = [];
         $idToDate = [];
@@ -140,28 +127,22 @@ final class Parser
         }
 
         $fileSize = \filesize($inputPath);
-        $segSize = (int)($fileSize / $numWorkers);
         $boundaries = [0];
         $fh = \fopen($inputPath, 'rb');
         for ($w = 1; $w < $numWorkers; $w++) {
-            \fseek($fh, $segSize * $w);
+            \fseek($fh, (int)($fileSize * $w / $numWorkers));
             \fgets($fh);
             $boundaries[] = \ftell($fh);
         }
         $boundaries[] = $fileSize;
         \fclose($fh);
 
-        $slugToIdx = \array_flip($slugOrderList);
-
-        // Temp file IPC: parent-as-coordinator, all workers write to temp files
         $tmpDir = \sys_get_temp_dir();
-        $childPids = [];
         $pidToWorker = [];
 
         for ($w = 0; $w < $numWorkers; $w++) {
             $pid = \pcntl_fork();
             if ($pid === 0) {
-                // Child: process segment $w and write output to temp file
                 $buckets = _hotLoop(
                     $inputPath, $boundaries[$w], $boundaries[$w + 1],
                     $dateToId, $slugOrderList, $chunkSize
@@ -170,8 +151,7 @@ final class Parser
                 $out = '';
                 foreach ($buckets as $slug => $packed) {
                     if ($packed === '') continue;
-                    $idx = $slugToIdx[$slug] ?? 0xFFFF;
-                    $out .= \pack('vV', $idx, \strlen($packed)) . $packed;
+                    $out .= \pack('vV', $slugToIdx[$slug], \strlen($packed)) . $packed;
                 }
                 unset($buckets);
 
@@ -179,7 +159,6 @@ final class Parser
                 \posix_kill(\posix_getpid(), 9);
                 exit(0);
             }
-            $childPids[] = $pid;
             $pidToWorker[$pid] = $w;
         }
 
