@@ -4,77 +4,6 @@ namespace App;
 
 \gc_disable();
 
-function _hotLoop(
-    string $inputPath, int $start, int $end,
-    array $dateToId, array $slugOrderList, int $chunkSize
-): array {
-    $buckets = \array_fill_keys($slugOrderList, '');
-
-    $fh = \fopen($inputPath, 'rb');
-    \stream_set_read_buffer($fh, 0);
-    \fseek($fh, $start);
-    $remaining = $end - $start;
-
-    while ($remaining > 0) {
-        $toRead = $remaining > $chunkSize ? $chunkSize : $remaining;
-        $raw = \fread($fh, $toRead);
-        if ($raw === false || $raw === '') break;
-        $rawLen = \strlen($raw);
-        $remaining -= $rawLen;
-
-        $lastNl = \strrpos($raw, "\n");
-        if ($lastNl === false) break;
-
-        $tail = $rawLen - $lastNl - 1;
-        if ($tail > 0) {
-            \fseek($fh, -$tail, SEEK_CUR);
-            $remaining += $tail;
-        }
-
-        $pos = 0;
-        $fence = $lastNl - 600;
-
-        if ($pos < $fence) {
-            do {
-                $nl = \strpos($raw, "\n", $pos + 52);
-                $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
-                $pos = $nl + 1;
-
-                $nl = \strpos($raw, "\n", $pos + 52);
-                $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
-                $pos = $nl + 1;
-
-                $nl = \strpos($raw, "\n", $pos + 52);
-                $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
-                $pos = $nl + 1;
-
-                $nl = \strpos($raw, "\n", $pos + 52);
-                $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
-                $pos = $nl + 1;
-
-                $nl = \strpos($raw, "\n", $pos + 52);
-                $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
-                $pos = $nl + 1;
-
-                $nl = \strpos($raw, "\n", $pos + 52);
-                $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
-                $pos = $nl + 1;
-            } while ($pos < $fence);
-        }
-
-        if ($pos < $lastNl) {
-            do {
-                $nl = \strpos($raw, "\n", $pos + 52);
-                if ($nl === false || $nl > $lastNl) break;
-                $buckets[\substr($raw, $pos + 25, $nl - $pos - 51)] .= $dateToId[\substr($raw, $nl - 23, 8)];
-                $pos = $nl + 1;
-            } while ($pos < $lastNl);
-        }
-    }
-    \fclose($fh);
-    return $buckets;
-}
-
 final class Parser
 {
     public function parse(string $inputPath, string $outputPath): void
@@ -90,14 +19,14 @@ final class Parser
 
         $sampleLen = \strlen($sample);
         $sPos = 0;
-        while ($sPos + 52 < $sampleLen) {
-            $nl = \strpos($sample, "\n", $sPos + 52);
-            if ($nl === false) break;
-            $slug = \substr($sample, $sPos + 25, $nl - $sPos - 51);
+        while ($sPos + 29 < $sampleLen) {
+            $c = \strpos($sample, ',', $sPos + 29);
+            if ($c === false) break;
+            $slug = \substr($sample, $sPos + 25, $c - $sPos - 25);
             if (!isset($slugToIdx[$slug])) {
                 $slugToIdx[$slug] = $slugCount++;
             }
-            $sPos = $nl + 1;
+            $sPos = $c + 27;
         }
         $slugOrderList = \array_keys($slugToIdx);
         unset($sample);
@@ -143,10 +72,72 @@ final class Parser
         for ($w = 0; $w < $numWorkers; $w++) {
             $pid = \pcntl_fork();
             if ($pid === 0) {
-                $buckets = _hotLoop(
-                    $inputPath, $boundaries[$w], $boundaries[$w + 1],
-                    $dateToId, $slugOrderList, $chunkSize
-                );
+                // Inlined hot loop
+                $buckets = \array_fill_keys($slugOrderList, '');
+                $fh = \fopen($inputPath, 'rb');
+                \stream_set_read_buffer($fh, 0);
+                $start = $boundaries[$w];
+                $end = $boundaries[$w + 1];
+                \fseek($fh, $start);
+                $remaining = $end - $start;
+
+                while ($remaining > 0) {
+                    $toRead = $remaining > $chunkSize ? $chunkSize : $remaining;
+                    $raw = \fread($fh, $toRead);
+                    if ($raw === false || $raw === '') break;
+                    $rawLen = \strlen($raw);
+                    $remaining -= $rawLen;
+
+                    $lastNl = \strrpos($raw, "\n");
+                    if ($lastNl === false) break;
+
+                    $tail = $rawLen - $lastNl - 1;
+                    if ($tail > 0) {
+                        \fseek($fh, -$tail, SEEK_CUR);
+                        $remaining += $tail;
+                    }
+
+                    $pos = 0;
+                    $fence = $lastNl - 600;
+
+                    if ($pos < $fence) {
+                        do {
+                            $c = \strpos($raw, ',', $pos + 29);
+                            $buckets[\substr($raw, $pos + 25, $c - $pos - 25)] .= $dateToId[\substr($raw, $c + 3, 8)];
+                            $pos = $c + 27;
+
+                            $c = \strpos($raw, ',', $pos + 29);
+                            $buckets[\substr($raw, $pos + 25, $c - $pos - 25)] .= $dateToId[\substr($raw, $c + 3, 8)];
+                            $pos = $c + 27;
+
+                            $c = \strpos($raw, ',', $pos + 29);
+                            $buckets[\substr($raw, $pos + 25, $c - $pos - 25)] .= $dateToId[\substr($raw, $c + 3, 8)];
+                            $pos = $c + 27;
+
+                            $c = \strpos($raw, ',', $pos + 29);
+                            $buckets[\substr($raw, $pos + 25, $c - $pos - 25)] .= $dateToId[\substr($raw, $c + 3, 8)];
+                            $pos = $c + 27;
+
+                            $c = \strpos($raw, ',', $pos + 29);
+                            $buckets[\substr($raw, $pos + 25, $c - $pos - 25)] .= $dateToId[\substr($raw, $c + 3, 8)];
+                            $pos = $c + 27;
+
+                            $c = \strpos($raw, ',', $pos + 29);
+                            $buckets[\substr($raw, $pos + 25, $c - $pos - 25)] .= $dateToId[\substr($raw, $c + 3, 8)];
+                            $pos = $c + 27;
+                        } while ($pos < $fence);
+                    }
+
+                    if ($pos < $lastNl) {
+                        do {
+                            $c = \strpos($raw, ',', $pos + 29);
+                            if ($c === false || $c > $lastNl) break;
+                            $buckets[\substr($raw, $pos + 25, $c - $pos - 25)] .= $dateToId[\substr($raw, $c + 3, 8)];
+                            $pos = $c + 27;
+                        } while ($pos < $lastNl);
+                    }
+                }
+                \fclose($fh);
 
                 $out = '';
                 foreach ($buckets as $slug => $packed) {
@@ -196,6 +187,11 @@ final class Parser
         $numSlugs = \count($slugOrderList);
         $slugsPerCounter = (int)\ceil($numSlugs / $numCounters);
 
+        $slugJsonHeaders = [];
+        foreach ($slugOrderList as $slug) {
+            $slugJsonHeaders[$slug] = '    "\/blog\/' . $slug . '": {' . "\n";
+        }
+
         // Large socket buffers via sockets extension (counting workers)
         $countPipes = [];
         for ($c = 0; $c < $numCounters; $c++) {
@@ -227,7 +223,7 @@ final class Parser
 
                     $counts = \array_count_values(\unpack('v*', $packed));
 
-                    $fragment .= $separator . '    "\/blog\/' . $slug . '": {' . "\n";
+                    $fragment .= $separator . $slugJsonHeaders[$slug];
                     $entrySep = '';
                     foreach ($dateJsonPrefix as $dId => $prefix) {
                         if (isset($counts[$dId])) {

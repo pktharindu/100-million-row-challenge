@@ -1,6 +1,31 @@
 #!/usr/bin/env php
 <?php
 
+// Fast-path bypass: skip Tempest framework boot for data:parse
+if (isset($argv[1]) && $argv[1] === 'data:parse') {
+    $inputPath = null;
+    $outputPath = null;
+    for ($i = 2; $i < $argc; $i++) {
+        if ($argv[$i] === '--input-path' && isset($argv[$i + 1])) {
+            $inputPath = $argv[++$i];
+        } elseif (str_starts_with($argv[$i], '--input-path=')) {
+            $inputPath = substr($argv[$i], 13);
+        } elseif ($argv[$i] === '--output-path' && isset($argv[$i + 1])) {
+            $outputPath = $argv[++$i];
+        } elseif (str_starts_with($argv[$i], '--output-path=')) {
+            $outputPath = substr($argv[$i], 14);
+        }
+    }
+    if ($inputPath !== null && $outputPath !== null) {
+        require_once __DIR__ . '/app/Parser.php';
+        $startTime = microtime(true);
+        new App\Parser()->parse($inputPath, $outputPath);
+        $executionTime = microtime(true) - $startTime;
+        echo "\033[92m\033[1m✓\033[39m\033[22m \033[2m\033[92m//\033[22m\033[39m\033[92m {$executionTime}\033[39m\n";
+        exit(0);
+    }
+}
+
 use Tempest\Console\ConsoleApplication;
 
 require_once getcwd() . '/vendor/autoload.php';
