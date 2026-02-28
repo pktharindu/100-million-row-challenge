@@ -81,7 +81,7 @@ final class Parser
                 \fseek($fh, $start);
                 $remaining = $end - $start;
 
-                while ($remaining > 0) {
+                do {
                     $toRead = $remaining > $chunkSize ? $chunkSize : $remaining;
                     $raw = \fread($fh, $toRead);
                     if ($raw === false || $raw === '') break;
@@ -136,7 +136,7 @@ final class Parser
                             $pos = $c + 27;
                         } while ($pos < $lastNl);
                     }
-                }
+                } while ($remaining > 0);
                 \fclose($fh);
 
                 $out = '';
@@ -213,8 +213,7 @@ final class Parser
                 $myStart = $c * $slugsPerCounter;
                 $myEnd = \min(($c + 1) * $slugsPerCounter, $numSlugs);
 
-                $fragment = '';
-                $separator = '';
+                $slugParts = [];
 
                 for ($s = $myStart; $s < $myEnd; $s++) {
                     $slug = $slugOrderList[$s];
@@ -222,18 +221,16 @@ final class Parser
                     if ($packed === '') continue;
 
                     $counts = \array_count_values(\unpack('v*', $packed));
+                    \ksort($counts);
 
-                    $fragment .= $separator . $slugJsonHeaders[$slug];
-                    $entrySep = '';
-                    foreach ($dateJsonPrefix as $dId => $prefix) {
-                        if (isset($counts[$dId])) {
-                            $fragment .= $entrySep . $prefix . $counts[$dId];
-                            $entrySep = ",\n";
-                        }
+                    $dateParts = [];
+                    foreach ($counts as $dId => $count) {
+                        $dateParts[] = $dateJsonPrefix[$dId] . $count;
                     }
-                    $fragment .= "\n    }";
-                    $separator = ",\n";
+                    $slugParts[] = $slugJsonHeaders[$slug] . \implode(",\n", $dateParts) . "\n    }";
                 }
+
+                $fragment = \implode(",\n", $slugParts);
 
                 $sock = $countPipes[$c][1];
                 $len = \strlen($fragment);
