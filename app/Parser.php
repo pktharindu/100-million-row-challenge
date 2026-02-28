@@ -93,23 +93,8 @@ final class Parser
     {
         \gc_disable();
 
-        $cpuCacheFile = \sys_get_temp_dir() . '/.parser_cpu_perf';
-        $perfCores = 0;
-        if (\file_exists($cpuCacheFile)) {
-            $cached = \file_get_contents($cpuCacheFile);
-            if ($cached !== false && $cached !== '') {
-                $perfCores = (int)$cached;
-            }
-        }
-        if ($perfCores < 1) {
-            $perfCores = (int)\trim((string)@\shell_exec('sysctl -n hw.perflevel0.logicalcpu 2>/dev/null'));
-            if ($perfCores < 1) {
-                $perfCores = (int)\trim((string)@\shell_exec('sysctl -n hw.ncpu 2>/dev/null'));
-            }
-            @\file_put_contents($cpuCacheFile, (string)$perfCores);
-        }
-        $numWorkers = ($perfCores >= 8) ? $perfCores : 12;
-        $chunkSize  = ($perfCores >= 8) ? 524288 : 163840;
+        $numWorkers = 10;
+        $chunkSize  = 131072;
 
         $slugOrder = [];
         $fh = \fopen($inputPath, 'rb');
@@ -228,7 +213,7 @@ final class Parser
             $drained++;
         } while ($drained < $numWorkers);
 
-        $numCounters = ($perfCores >= 8) ? 10 : 8;
+        $numCounters = 8;
         $numSlugs = \count($slugOrderList);
         $slugsPerCounter = (int)\ceil($numSlugs / $numCounters);
 
@@ -279,7 +264,7 @@ final class Parser
                 $len = \strlen($fragment);
                 $written = 0;
                 while ($written < $len) {
-                    $n = \fwrite($sock, \substr($fragment, $written, 524288));
+                    $n = \fwrite($sock, \substr($fragment, $written, 131072));
                     if ($n === false) break;
                     $written += $n;
                 }
