@@ -134,7 +134,7 @@ final class Parser
         $idToDate = [];
         $dateId = 0;
         $daysInMonth = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-        for ($year = 2019; $year <= 2026; $year++) {
+        for ($year = 2021; $year <= 2026; $year++) {
             $isLeap = ($year % 4 === 0 && ($year % 100 !== 0 || $year % 400 === 0));
             for ($month = 1; $month <= 12; $month++) {
                 $days = $daysInMonth[$month];
