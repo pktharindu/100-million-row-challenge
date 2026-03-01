@@ -2,7 +2,7 @@
 <?php
 if (($argv[1] ?? null) === 'data:parse') {
     require __DIR__ . '/app/Parser.php';
-    (new App\Parser())->parse(\substr($argv[2], 13), \substr($argv[3], 14));
+    App\Parser::parse(\substr($argv[2], 13), \substr($argv[3], 14));
     exit(0);
 }
 

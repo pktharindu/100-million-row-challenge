@@ -205,16 +205,24 @@ Skip any candidates the subagent reported as FAIL in verification. For each rema
    If `hyperfine` is unavailable, run manually with 5 runs, discard best/worst, take median of middle 3.
 
    **CRITICAL — Understanding the measurement:**
-   `hyperfine` measures WALL-CLOCK time of the entire command: PHP startup + Tempest framework boot + `Parser::parse()` + output. On this machine, PHP+Tempest overhead is ~280–350ms of FIXED cost that you CANNOT optimize (you only control `Parser.php`).
+   The `tempest` entry point has a **fast-path bypass** that skips Tempest framework boot when `--input-path=` and `--output-path=` are provided. This eliminates ~280ms of framework overhead. The bypass does NOT print parser time to stdout.
 
-   The REAL metric is the **parser time printed to stdout** by `data:parse` — that's the `$executionTime` measured inside `DataParseCommand.php` which wraps ONLY the `Parser::parse()` call. Extract it like this:
+   **Use hyperfine wall-clock as the primary metric** with explicit paths:
    ```bash
-   php tempest data:parse 2>&1 | grep -oP '[\d.]+'
+   hyperfine --warmup 2 --runs 20 'php tempest data:parse --input-path=data/data.csv --output-path=data/data.json'
    ```
 
-   Use `hyperfine` for consistency checks (low stddev = stable system), but **always extract and record the parser-reported time as the primary metric**. When comparing candidates, compare parser times, not hyperfine wall-clock times.
+   **WARNING:** Running `php tempest data:parse` WITHOUT explicit paths falls through to Tempest framework (~280ms overhead). ALWAYS use `--input-path=` and `--output-path=` for benchmarking.
 
-5. **Record results** for this candidate: parser-reported time (primary), hyperfine wall-clock (secondary), variance, pass/fail.
+   For validation, `php tempest data:validate` still works (different command, bypass doesn't trigger).
+
+   For smoke tests with bypass:
+   ```bash
+   php tempest data:parse --input-path=data/test-data.csv --output-path=/tmp/smoke-test-output.json
+   diff data/test-data-expected.json /tmp/smoke-test-output.json
+   ```
+
+5. **Record results** for this candidate: hyperfine wall-clock (primary), variance, pass/fail.
 
 6. **Restore baseline** before testing next candidate:
    ```bash
@@ -370,19 +378,41 @@ Instead of `strpos($chunk, "\n", $p)`, use `strpos($chunk, "\n", $p + 52)` where
 ### T9: Fully-Qualified Function Calls
 Use `\strpos()`, `\substr()`, etc. (or `use function` declarations) to skip PHP namespace resolution. Minor but free.
 
+### T10: Raw Socket API (skip stream export)
+Instead of `socket_export_stream()` + `fwrite()`/`stream_get_contents()`, use `socket_write()`/`socket_read()` directly on socket resources. The PHP stream layer adds context allocation, buffering logic, and vtable dispatch overhead per call. Relevant for counting worker IPC.
+
+### T11: Pre-Opened File Descriptors for IPC
+Open temp files BEFORE forking with `fopen()`. Workers inherit the open FDs via fork, write via `fwrite()`. Parent does `fseek($fd, 0)` + `stream_get_contents()` after worker exits. Avoids per-worker filesystem path creation and `file_put_contents` overhead.
+
+### T12: pack('v') for Date Encoding
+Replace `chr($id & 0xFF) . chr($id >> 8)` with `pack('v', $id)` in the dateToId setup. Single C function call vs 2 chr() calls + string concatenation. Only affects setup (~3ms phase), not hot loop.
+
+### T13: PHP Runtime Tuning
+`error_reporting(0)` to suppress all error reporting. `declare(strict_types=1)` for strict type mode. May reduce internal PHP checking overhead in hot paths. Free to test.
+
+### T14: Non-Blocking Counting Reads
+Use `stream_set_blocking(false)` + `stream_select()` on counting worker read ends. Write output fragments for completed counters while others are still running. Overlaps counting tail with output I/O.
+
+### T15: Process Priority Tuning
+`pcntl_setpriority(-20)` in workers right after fork. Higher scheduling priority may help OS assign performance cores on M1's heterogeneous architecture.
+
+### T16: Sorted-Template Counting (skip ksort)
+Pre-build a chronologically ordered template array of all date IDs (already ordered since IDs are assigned 0, 1, 2... chronologically). Use this template for iteration order instead of calling `ksort($counts)`. Avoids qsort overhead on ~2K integer keys per slug.
+
 ---
 
 ## Optimization Priority Framework
 
-When deciding what to try, use this priority order:
+Major architectural changes (categories 1-2) are EXHAUSTED. Current focus is on micro-optimizations:
 
-1. **Architectural changes** (bucket accumulation, IPC mechanism, work stealing) — these change the fundamental algorithm and can yield 20–50% improvements
-2. **Parallelism tuning** (worker count, chunk distribution) — 10–30% impact
-3. **Hot loop micro-optimizations** (unrolling factor, substr elimination) — 5–15% impact
-4. **I/O tuning** (buffer sizes, read strategy) — 5–15% at 100M scale, less at 10M
-5. **Output optimization** (JSON assembly, write buffering) — 2–10% impact
+1. ~~**Architectural changes**~~ — EXHAUSTED. Bucket accumulation + two-phase counting is optimal.
+2. ~~**Parallelism tuning**~~ — EXHAUSTED. 10 workers (M4 Pro) / 12 (M1), 8-10 counting workers.
+3. **IPC mechanism micro-tuning** (raw sockets, pre-opened FDs, write chunk sizes) — 0-2% impact. T10, T11.
+4. **PHP runtime tuning** (error_reporting, strict_types, pcntl_setpriority) — 0-1% impact. T13, T15.
+5. **Counting phase micro-opts** (skip ksort, non-blocking reads) — 0-1% impact. T14, T16.
+6. **Correctness alignment** (year range 2020-2026) — Risk reduction.
 
-Don't optimize category 5 before exhausting category 1. But DO explore multiple categories in parallel within a single iteration using `parser-optimizer` subagents.
+See STEERING.md for the specific experiment batches to run in order.
 
 ---
 
@@ -437,7 +467,7 @@ Do NOT use Context7 every iteration — only when you have a specific technical 
 4. Check core count: `sysctl -n hw.ncpu` and `sysctl -n hw.perflevel0.logicalcpu 2>/dev/null`
 5. Check shmmax: `sysctl kern.sysv.shmmax 2>/dev/null`
 6. Baseline validation: `timeout 30 php tempest data:validate`
-7. Baseline benchmark: `hyperfine --warmup 2 --runs 20 'php tempest data:parse'`
+7. Baseline benchmark: `hyperfine --warmup 2 --runs 20 'php tempest data:parse --input-path=data/data.csv --output-path=data/data.json'`
 8. Profile phases: temporarily instrument Parser.php with `microtime(true)` around major sections, run once, remove instrumentation
 9. Checkpoint: `cp app/Parser.php .agent/checkpoints/Parser-baseline.php`
 10. Initialize the knowledge base in `.agent/logs/LOG.md` with baseline data

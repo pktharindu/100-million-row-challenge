@@ -6,7 +6,7 @@ namespace App;
 
 final class Parser
 {
-    public function parse(string $inputPath, string $outputPath): void
+    public static function parse(string $inputPath, string $outputPath): void
     {
         $numWorkers = 10;
         $chunkSize  = 131072;
