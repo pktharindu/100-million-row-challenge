@@ -72,7 +72,6 @@ final class Parser
         for ($w = 0; $w < $numWorkers; $w++) {
             $pid = \pcntl_fork();
             if ($pid === 0) {
-                // Inlined hot loop
                 $buckets = \array_fill_keys($slugOrderList, '');
                 $fh = \fopen($inputPath, 'rb');
                 \stream_set_read_buffer($fh, 0);
@@ -153,7 +152,6 @@ final class Parser
             $pidToWorker[$pid] = $w;
         }
 
-        // Parent enters waitpid(-1) drain loop — processes workers in completion order
         $mergedBuckets = \array_fill_keys($slugOrderList, '');
         $drained = 0;
 
@@ -168,7 +166,6 @@ final class Parser
             $data = \file_get_contents($tmpFile);
             \unlink($tmpFile);
 
-            // TLV merge
             $offset = 0;
             $dataLen = \strlen($data);
             while ($offset < $dataLen) {
@@ -192,7 +189,6 @@ final class Parser
             $slugJsonHeaders[$slug] = '    "\/blog\/' . $slug . '": {' . "\n";
         }
 
-        // Large socket buffers via sockets extension (counting workers)
         $countPipes = [];
         for ($c = 0; $c < $numCounters; $c++) {
             \socket_create_pair(AF_UNIX, SOCK_STREAM, 0, $rawPair);
