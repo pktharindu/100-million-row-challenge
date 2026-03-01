@@ -8,8 +8,24 @@ final class Parser
 {
     public static function parse(string $inputPath, string $outputPath): void
     {
-        $numWorkers = 10;
-        $chunkSize  = 131072;
+        $cpuCacheFile = \sys_get_temp_dir() . '/.parser_cpu_perf';
+        if (\file_exists($cpuCacheFile)) {
+            $perfCores = (int)\file_get_contents($cpuCacheFile);
+        } else {
+            $perfCores = (int)\shell_exec('sysctl -n hw.perflevel0.logicalcpu 2>/dev/null') ?: ((int)\shell_exec('sysctl -n hw.ncpu 2>/dev/null') ?: 8);
+            \file_put_contents($cpuCacheFile, (string)$perfCores);
+        }
+        if ($perfCores >= 8) {
+            // M4 Pro or similar: 10 workers, 128KB chunks, 8 counting workers
+            $numWorkers = 10;
+            $chunkSize = 131072;
+            $numCounters = 8;
+        } else {
+            // M1 or similar: 12 workers, 160KB chunks, 8 counting workers
+            $numWorkers = 12;
+            $chunkSize = 163840;
+            $numCounters = 8;
+        }
 
         $slugToIdx = [];
         $slugCount = 0;
@@ -180,7 +196,6 @@ final class Parser
             $drained++;
         } while ($drained < $numWorkers);
 
-        $numCounters = 8;
         $numSlugs = \count($slugOrderList);
         $slugsPerCounter = (int)\ceil($numSlugs / $numCounters);
 
