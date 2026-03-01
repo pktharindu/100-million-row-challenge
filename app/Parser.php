@@ -35,7 +35,7 @@ final class Parser
         $idToDate = [];
         $dateId = 0;
         $daysInMonth = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-        for ($year = 2021; $year <= 2026; $year++) {
+        for ($year = 2020; $year <= 2026; $year++) {
             $isLeap = ($year % 4 === 0 && ($year % 100 !== 0 || $year % 400 === 0));
             for ($month = 1; $month <= 12; $month++) {
                 $days = $daysInMonth[$month];
@@ -43,7 +43,7 @@ final class Parser
                 for ($day = 1; $day <= $days; $day++) {
                     $yy = $year - 2000;
                     $dateStr8 = ($yy < 10 ? '0' : '') . $yy . '-' . ($month < 10 ? '0' : '') . $month . '-' . ($day < 10 ? '0' : '') . $day;
-                    $dateToId[$dateStr8] = \chr($dateId & 0xFF) . \chr($dateId >> 8);
+                    $dateToId[$dateStr8] = \pack('v', $dateId);
                     $idToDate[$dateId] = \sprintf('%04d-%02d-%02d', $year, $month, $day);
                     $dateId++;
                 }
