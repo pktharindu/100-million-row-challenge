@@ -137,18 +137,15 @@ final class Parser
                         } while ($pos < $lastNl);
                     }
                 } while ($remaining > 0);
-                \fclose($fh);
 
                 $out = '';
                 foreach ($buckets as $slug => $packed) {
                     if ($packed === '') continue;
                     $out .= \pack('vV', $slugToIdx[$slug], \strlen($packed)) . $packed;
                 }
-                unset($buckets);
 
                 \file_put_contents($tmpDir . '/parser_w' . $w, $out);
                 \posix_kill(\posix_getpid(), 9);
-                exit(0);
             }
             $pidToWorker[$pid] = $w;
         }
@@ -238,7 +235,6 @@ final class Parser
                 }
                 \fclose($sock);
                 \posix_kill(\posix_getpid(), 9);
-                exit(0);
             }
             $countPids[] = $pid;
         }
