@@ -44,7 +44,7 @@ final class Parser
                 for ($day = 1; $day <= $days; $day++) {
                     $yy = $year - 2000;
                     $dateStr8 = ($yy < 10 ? '0' : '') . $yy . '-' . ($month < 10 ? '0' : '') . $month . '-' . ($day < 10 ? '0' : '') . $day;
-                    $dateToId[$dateStr8] = \pack('v', $dateId);
+                    $dateToId[$dateStr8] = \chr($dateId & 0xFF) . \chr($dateId >> 8);
                     $idToDate[$dateId] = \sprintf('%04d-%02d-%02d', $year, $month, $day);
                     $dateId++;
                 }
