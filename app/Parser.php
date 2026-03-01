@@ -8,24 +8,9 @@ final class Parser
 {
     public static function parse(string $inputPath, string $outputPath): void
     {
-        $cpuCacheFile = \sys_get_temp_dir() . '/.parser_cpu_perf';
-        if (\file_exists($cpuCacheFile)) {
-            $perfCores = (int)\file_get_contents($cpuCacheFile);
-        } else {
-            $perfCores = (int)\shell_exec('sysctl -n hw.perflevel0.logicalcpu 2>/dev/null') ?: ((int)\shell_exec('sysctl -n hw.ncpu 2>/dev/null') ?: 8);
-            \file_put_contents($cpuCacheFile, (string)$perfCores);
-        }
-        if ($perfCores >= 8) {
-            // M4 Pro or similar: 10 workers, 128KB chunks, 8 counting workers
-            $numWorkers = 10;
-            $chunkSize = 131072;
-            $numCounters = 8;
-        } else {
-            // M1 or similar: 12 workers, 160KB chunks, 8 counting workers
-            $numWorkers = 12;
-            $chunkSize = 163840;
-            $numCounters = 8;
-        }
+        $numWorkers = 10;
+        $chunkSize = 131072;
+        $numCounters = 8;
 
         $slugToIdx = [];
         $slugCount = 0;
@@ -51,7 +36,7 @@ final class Parser
         $idToDate = [];
         $dateId = 0;
         $daysInMonth = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-        for ($year = 2020; $year <= 2026; $year++) {
+        for ($year = 2021; $year <= 2026; $year++) {
             $isLeap = ($year % 4 === 0 && ($year % 100 !== 0 || $year % 400 === 0));
             for ($month = 1; $month <= 12; $month++) {
                 $days = $daysInMonth[$month];
