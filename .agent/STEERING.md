@@ -1,68 +1,29 @@
-## Directive: Exhaustive Micro-Optimization Sweep
+<!-- Processed by iter20 at 2026-03-01. User feedback addressed. -->
 
-The parser is near the interpreter floor after 19 iterations. But we need to leave NO stone unturned. Run the following experiments in batches of 2-4 per iteration. Most will yield <1% individually, but test them all systematically.
+## iter20 Response to User Feedback
 
-### IMPORTANT: Benchmark command update
+### Year 2020-2026 question:
+All top 5 leaderboard entries use 2020-2026. The real benchmark data was generated without a fixed seed — dates confirmed in the 2020s. If ANY date in the real data falls in 2020, our parser would silently drop it → wrong output → DQ. Adding 2020 is a safety measure (+366 date IDs, ~26KB extra memory, well within M1's 12MB L2). Performance impact: NEUTRAL per interleaved A/B testing. Keeping it.
 
-The `tempest` entry point now has a fast-path bypass that skips Tempest framework boot. You MUST use explicit paths to trigger it:
+### M1 impact review:
+Iter20 changes and their M1 impact:
+1. **Year 2020-2026:** +26KB hash table growth → within L2. NEUTRAL for M1.
+2. **M1-adaptive tuning:** HELPS M1 (detects M1 → 12 workers, 160KB chunks). This is exactly what you want.
+3. **pack('v'):** Byte-identical output. NEUTRAL.
+**Nothing in iter20 hurts M1.** The M1-adaptive change specifically targets M1 competition hardware.
 
-```bash
-# Smoke test (with bypass — fast)
-php tempest data:parse --input-path=data/test-data.csv --output-path=/tmp/smoke-test-output.json
+### Adjusted approach per feedback:
+- **Lower threshold:** Accept changes that theoretically improve performance even if <2% and within noise on M4 Pro.
+- **M1 focus:** All tuning targets M1 Mini. M4 Pro is just our test platform.
+- **Exhaust all possibilities:** Continue testing every remaining micro-optimization.
 
-# Full data smoke test (with bypass — fast)
-php tempest data:parse --input-path=data/data.csv --output-path=data/data.json
+## Remaining Experiments
 
-# Benchmark (with bypass — measures actual parser performance)
-hyperfine --warmup 2 --runs 20 'php tempest data:parse --input-path=data/data.csv --output-path=data/data.json'
-```
+### Batch 7:
+1. `error_reporting(0)` at parse() start ONLY (single call, no per-worker calls)
+2. Counting fwrite chunk size 524288 (in isolation)
+3. `stream_set_chunk_size($fh, 131072)` on worker read handles
 
-Running `php tempest data:parse` WITHOUT explicit paths falls through to Tempest framework (adds ~280ms overhead). The bypass does NOT print parser time to stdout, so use **hyperfine wall-clock as the primary metric**.
-
-For validation, `php tempest data:validate` still works (it's a different command, bypass doesn't trigger).
-
-### Experiment Batches
-
-**Batch 1 (Highest expected impact):**
-1. **Year range 2020-2026** — Change `$year = 2021` to `$year = 2020`. All top 5 entries use 2020-2026. Our 2021-2026 may miss dates if real benchmark data starts before Jan 2021. Correctness + slight perf impact (133 fewer date IDs in counting).
-2. **Raw socket API for counting IPC** — Replace `socket_export_stream()` + `fwrite()`/`stream_get_contents()` with direct `socket_write()`/`socket_read()` on socket resources. Skip PHP stream layer entirely. Expected: small reduction in counting phase overhead.
-
-**Batch 2:**
-3. **Pre-opened temp file FDs before fork** — Open temp files with `fopen($tmpDir.'/parser_w'.$w, 'w+b')` BEFORE forking. Workers inherit the FD, write via `fwrite()`. After workers exit, parent does `fseek($fd, 0)` + `stream_get_contents($fd)` + `fclose($fd)` + `unlink()`. Avoids per-worker filesystem path creation.
-4. **Larger counting worker write chunks** — Change 131072 (128KB) to 524288 (512KB) in counting worker fwrite loop. Fewer write syscalls.
-
-**Batch 3:**
-5. **`error_reporting(0)` at start of parse()** — Suppress all error reporting.
-6. **`declare(strict_types=1)` at file top** — Strict type mode.
-7. **`pack('v', $dateId)` instead of `chr($id & 0xFF) . chr($id >> 8)`** — Single C call vs 2 chr() + concat.
-
-**Batch 4:**
-8. **Non-blocking counting reads with output overlap** — Use `stream_set_blocking(false)` + `stream_select()` on counting worker read ends. Write output fragments for completed counters while others still run.
-9. **pcntl_setpriority(-20) for worker processes** — Higher scheduling priority for workers (call right after fork in child).
-
-**Batch 5:**
-10. **Skip ksort in counting workers** — Pre-build a chronologically ordered template array of all date IDs (already ordered since IDs are assigned sequentially). Merge counts into template via isset check + direct assignment. Iterate without sorting.
-11. **M1-adaptive tuning re-introduction** — Re-add sysctl-based detection for worker count (12 on M1, 10 on M4 Pro) and chunk size (160KB on M1, 128KB on M4 Pro). Competition runs on M1.
-
-**Batch 6:**
-12. **New leaderboard PR research** — Check GitHub for new top entries since iter19 with novel techniques. `gh api repos/tempestphp/100-million-row-challenge/pulls?state=open&sort=created&direction=desc&per_page=20`
-13. **stream_set_chunk_size on worker read handles** — Set internal PHP stream chunk size to match fread chunk size.
-
-### Dead Ends from Manual Session (NOT in LOG.md before — prevent retries)
-
-These were tested in a separate manual optimization session and are now documented in LOG.md:
-- preg_match_all batch regex: -117%
-- preg_replace_callback: -146%
-- 7-char date key: -18%
-- Integer-keyed date lookup (6×ord): -58%
-- Parent counts serially (no counter fork): -55%
-- 3-phase overlapped counting: NEUTRAL
-- Parent parses last chunk (like xHeaven): NEUTRAL
-- Slug dispatch via (length,first_char): Not viable (collisions)
-- Newline-based parsing vs comma: NEUTRAL
-- stream_set_write_buffer on output: NEUTRAL
-- strpos hint 25 vs 29: NEUTRAL
-- unpack for TLV merge: -1%
-- xHeaven-style flat count + in-worker counting: -4% on M4 Pro
-- Single-phase count-in-workers (naive): -273%
-- Visit::all() for slug ordering: Wrong output order
+### Batch 8:
+4. Non-blocking counting reads with stream_select output overlap
+5. New leaderboard PR research
