@@ -14,9 +14,10 @@ You are a PHP performance optimization specialist. You receive a specific optimi
 1. Read the current `app/Parser.php`
 2. Implement the EXACT optimization described in your task prompt
 3. Modify ONLY `app/Parser.php` — no other files
-4. **Verify your code works** — run validation and a smoke test (see below)
-5. If verification fails, fix the issue or report what went wrong
-6. Report back: what you changed, why, results of verification, and any concerns
+4. **CRITICAL: Do NOT change the method signature.** It MUST remain `public static function parse(...)`. Do NOT remove `static`. Do NOT change visibility. Do NOT rename the method.
+5. **Verify your code works** — run validation and a smoke test (see below)
+6. If verification fails, fix the issue or report what went wrong
+7. Report back: what you changed, why, results of verification, and any concerns
 
 ## Verification (REQUIRED before reporting back)
 
@@ -57,7 +58,7 @@ The parser processes CSV lines of format:
 
 ## Date range
 
-The real benchmark data has dates in **2020-2026**. The parser hardcodes years 2019-2028 which covers this with margin. All top leaderboard entries do the same. Do NOT implement dynamic date discovery — it adds overhead for no benefit. The local test dataset uses `--seed=1709251200` (dates ~2019-2024), which also fits within 2019-2028.
+The real benchmark data has dates in **2021-2026** (confirmed: no 2020 dates). The parser hardcodes years 2021-2026 (2191 dates). Do NOT change this range. Do NOT implement dynamic date discovery — it adds overhead for no benefit.
 
 ## Important performance notes (from iteration 2-9 experiments)
 
@@ -73,7 +74,7 @@ The real benchmark data has dates in **2020-2026**. The parser hardcodes years 2
 - **Work stealing with flock is SLOWER on M4 Pro** (+4.6%).
 - **Socket buffer size already tuned to 2MB** via socket_set_option. kern.ipc.maxsockbuf is 8MB.
 - **8x loop unrolling is NOT measurably better than 6x.**
-- **The parser now has TWO fork phases:** (1) N parsing workers (all children, parent coordinates), (2) **10** counting+JSON workers. When modifying, understand both phases.
+- **The parser now has TWO fork phases:** (1) 10 parsing workers (all children, parent coordinates), (2) **8** counting+JSON workers. When modifying, understand both phases.
 - **The counting workers receive merged data via COW fork** — they read $mergedBuckets via key-based access. Each worker processes a range of slugs and sends JSON fragments via pipe.
 - **Child workers use posix_kill(SIGKILL) for fast exit** — skips PHP shutdown overhead (~17ms saved). Place AFTER fclose($sock) to ensure data is flushed.
 - **JSON generation MUST be parallel** — single-threaded JSON for 270 slugs × 3000+ dates takes ~90ms. With 8 parallel workers it's ~22ms. NEVER move JSON generation to a single thread.

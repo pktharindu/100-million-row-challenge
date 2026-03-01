@@ -1,9 +1,9 @@
 # Parser Optimization Knowledge Base
 
 ## Current State
-- **Best wall-clock (100M, bypass):** ~1.20s (hyperfine mean, fast-path bypass, M4 Pro)
-- **Iteration count:** 20
-- **Parser architecture:** Parent-as-coordinator + temp file IPC. 12 workers for M1 (10 on M4 Pro). All workers are children (parent does no hotloop). Workers write TLV-encoded output to temp files (file_put_contents). Parent uses waitpid(-1) to drain workers in completion order, overlapping drain with worker execution. Unbuffered I/O (stream_set_read_buffer 0), 6x loop unrolling, bucket accumulation with 2-byte date IDs (pack('v') encoding, 8-char "YY-MM-DD" keys), adaptive read chunks (128KB on M4 Pro, 160KB on M1), zero-copy hot loop, 8 counting workers with pre-computed JSON date prefixes (dateJsonPrefix) via socket IPC, SIGKILL fast exit, 512KB slug sample, fence at lastNl - 600, year range 2020-2026 (2557 dates), sysctl-cached M1/M4 Pro detection.
+- **Best wall-clock (100M, bypass):** ~1.19s (hyperfine mean, fast-path bypass, M4 Pro)
+- **Iteration count:** 21
+- **Parser architecture:** Parent-as-coordinator + temp file IPC. Fixed 10 workers (no adaptive detection). All workers are children (parent does no hotloop). Workers write TLV-encoded output to temp files (file_put_contents). Parent uses waitpid(-1) to drain workers in completion order, overlapping drain with worker execution. Unbuffered I/O (stream_set_read_buffer 0), 6x loop unrolling, bucket accumulation with 2-byte date IDs (pack('v') encoding, 8-char "YY-MM-DD" keys), 128KB read chunks, zero-copy hot loop, 8 counting workers with pre-computed JSON date prefixes (dateJsonPrefix) via socket IPC, SIGKILL fast exit, 512KB slug sample, fence at lastNl - 600, year range 2021-2026 (2191 dates).
 
 ## Bottleneck Model (iter16 — 100M scale, MEASURED via microtime instrumentation)
 | Phase | Time (100M) | % Internal | Serial? |
@@ -28,7 +28,7 @@
 
 | Technique | Status | Notes |
 |-----------|--------|-------|
-| Multi-process fork | DONE | Cached-sysctl adaptive workers |
+| Multi-process fork | DONE | Fixed 10 workers (sysctl detection removed iter21) |
 | Bucket accumulation (T1) | DONE | Per-slug string append + unpack + array_count_values |
 | 6x loop unrolling (T3) | DONE | Fence at lastNl - 600. 8x tested no improvement |
 | Position-based parsing (T4) | DONE | substr with hardcoded offsets, strpos +52 skip |
@@ -36,10 +36,10 @@
 | Parent-as-coordinator | DONE (iter15) | Parent forks ALL workers, drains via waitpid(-1) in completion order. -4.3% at 100M. |
 | Fully-qualified calls (T9) | DONE | backslash prefix on all global functions |
 | gc_disable | DONE | At top of file and parse() |
-| Worker count tuning (T2) | DONE | M1: 12 workers, M4 Pro: 10 workers (perfCores >= 8 → perfCores, else 12) |
+| Worker count tuning (T2) | DONE | Fixed 10 workers (adaptive removed iter21 per user directive) |
 | Newline skip (T8) | DONE | strpos offset +52 |
-| Chunk size tuning | DONE | 512KB on M4 Pro, 160KB on M1 (adaptive, iter17) |
-| Parallel counting | DONE | 10 workers on M4 Pro, 8 on M1 (adaptive, iter17) |
+| Chunk size tuning | DONE | Fixed 128KB (adaptive removed iter21 per user directive) |
+| Parallel counting | DONE | Fixed 8 counting workers |
 | Optimized JSON output | DONE | Pre-computed dateJsonPrefix, ksort-free |
 | Zero-copy hot loop | DONE (iter4) | Eliminated leftover.raw concatenation |
 | SIGKILL fast exit | DONE (iter5) | posix_kill(SIGKILL) skips PHP shutdown |
@@ -53,7 +53,7 @@
 | 10 counting workers | DONE (iter12) | Expected ~20ms saving at 100M |
 | M1 worker formula (12 workers) | DONE (iter12) | Matches top leaderboard entries for M1 |
 | do-while loops (iter16) | DONE | Eliminates JMP opcode per iteration in hot loops. Part of -1.6% combined improvement. |
-| Year range 2019-2026 (iter16) | DONE | 3653→2922 dates. 20% less iteration in counting workers. |
+| Year range 2021-2026 (iter21) | DONE | 2191 dates. User confirmed real data has no 2020 dates. |
 | **M1-adaptive chunk size (iter17)** | **DONE** | **160KB on M1 (perfCores<8), 512KB on M4 Pro. Matches xHeaven #1.** |
 | **M1-adaptive counting workers (iter17)** | **DONE** | **8 on M1, 10 on M4 Pro. 1:1 with M1 cores.** |
 | **Implode-based JSON in counting (iter17)** | **TESTED** | **NEUTRAL on M4 Pro. +0.2% (within noise). Array collection + implode is not faster than .= concat for this workload.** |
@@ -69,6 +69,10 @@
 | **Combined micro-opts (iter20)** | **TESTED** | **+10% REGRESSION. pcntl_setpriority(-20) fails with EPERM (syscall overhead), set_error_handler(null) per-worker adds overhead, declare(strict_types=1) may slow some paths.** |
 | **Skip ksort in counting (iter20)** | **TESTED** | **+4% REGRESSION. Iterating all 2557 dateJsonPrefix entries with isset checks is slower than ksort on ~2000 integer keys. PHP's C-level qsort on int keys is very efficient.** |
 | **256KB read chunks (iter20)** | **TESTED** | **NEUTRAL (+2%, within ordering bias). 128KB remains optimal on M4 Pro.** |
+| **error_reporting(0) alone (iter21)** | **TESTED** | **NEUTRAL. Single call at parse() start. No measurable impact on M4 Pro.** |
+| **stream_set_chunk_size + fwrite 524K (iter21)** | **TESTED** | **NEUTRAL to slight regression (+2.7%). stream_set_chunk_size adds overhead, larger fwrite chunks don't help.** |
+| **160KB chunks (standalone, iter21)** | **TESTED** | **NEUTRAL on M4 Pro (+1.1%). 128KB remains optimal.** |
+| **Remove sysctl + year 2021-2026 (iter21)** | **APPLIED** | **User directive. Real data confirmed no 2020 dates. Removes adaptive detection. Performance neutral.** |
 | Comma-based parsing (iter16) | TESTED | NEUTRAL. Same opcode count, SIMD trivial. |
 | 160KB read chunks (iter16) | TESTED | -16% REGRESSION on M4 Pro. Now used adaptively for M1 only. |
 | Temp file IPC only (no coordinator) | TESTED (iter15) | ~1.7% improvement — marginal, below 2% threshold |
@@ -196,11 +200,11 @@ Full architecture of the #1 entry:
 Top entry techniques (from GitHub PR analysis):
 | Technique | xHeaven (#3, ~3.0s self) | johnwedgbury (#116, ~3.0s self) | dannyvankooten (#65, ~3.2s self) | gere-lajos (#16) | Ours |
 |---|---|---|---|---|---|
-| Workers | 10 (9+parent) | 12 | 12 | 12 | 12 on M1, 10 on M4 Pro |
+| Workers | 10 (9+parent) | 12 | 12 | 12 | 10 (fixed) |
 | IPC | Temp files (v* packed) | Unix sockets + stream_select | Temp files (I* packed) | Temp files (v* packed) | Temp files (TLV) |
-| Read chunk | 160 KB | 4 MB | 256 KB | 160 KB | 160KB M1 / 128KB M4 Pro |
+| Read chunk | 160 KB | 4 MB | 256 KB | 160 KB | 128KB (fixed) |
 | Date key | 8 chars (YY-MM-DD) | 8 chars | 8 chars | 8 chars | 8 chars |
-| Year range | 2020-2026 | 2020-2026 | 2020-2026 | dynamic | 2020-2026 |
+| Year range | 2020-2026 | 2020-2026 | 2020-2026 | dynamic | 2021-2026 |
 | Count strategy | Bucket + worker-side count → flat array | Bucket + worker-side count → flat array (adaptive v/V) | Bucket + worker-side foreach → flat grid I* | Bucket + worker-side count → flat array v* | Bucket + parallel counting (2nd fork wave) |
 | Second fork wave | No | No | No | No | Yes (8-10 workers) |
 | Loop unrolling | 6x | 6x | None | 6x | 6x |
@@ -249,26 +253,26 @@ This measures: PHP startup (~15ms) + bypass (<1ms) + Parser::parse(). Framework 
 
 **Statistical rigor (iter12):** With measurement stddev ~5ms at 10M / ~40ms at 100M, need ~24 interleaved pairs for 80% power to detect a 2% effect.
 
-## Remaining Ideas (reassessed post-iter20, exhaustive sweep nearly complete)
+## Remaining Ideas (reassessed post-iter21, exhaustive sweep NEARLY COMPLETE)
 
 ### Still untested
-1. **`error_reporting(0)` at parse() start ONLY** — Just the single call, NOT combined with pcntl_setpriority or per-worker calls. The iter20 combined test failed because of OTHER changes. This one call is truly free.
-2. **`stream_set_chunk_size` on worker read handles** — Set internal PHP stream chunk size to match fread chunk size. May reduce internal buffer management.
-3. **Non-blocking counting reads with output overlap** — Use `stream_set_blocking(false)` + `stream_select()` on counting worker sockets. Write output for completed counters while others still run. Complex but could save ~5-10ms by overlapping counting tail with output I/O.
-4. **New leaderboard PR research** — Check GitHub for new top entries since iter19 with novel techniques.
-5. **Counting fwrite chunk size 524288** — Change 131072 to 524288 in counting worker fwrite loop. NOT yet tested in isolation (was part of combined candidate D which regressed).
+1. **Non-blocking counting reads with output overlap** — Use `stream_set_blocking(false)` + `stream_select()` on counting worker sockets. Write output for completed counters while others still run. Complex but could save ~5-10ms by overlapping counting tail with output I/O. LAST remaining micro-opt.
+2. **New leaderboard PR research** — Check GitHub for new top entries since iter19 with novel techniques.
+
+### Tested and rejected in iter21 (DO NOT RETRY)
+- **error_reporting(0) at parse() start ONLY:** NEUTRAL on M4 Pro. Single call doesn't measurably impact hot loop throughput.
+- **stream_set_chunk_size($fh, 131072) on worker reads:** NEUTRAL to slight regression when combined with fwrite 524K.
+- **Counting fwrite chunk size 524288:** NEUTRAL to slight regression. Tested in combination with stream_set_chunk_size.
+- **160KB read chunks (standalone):** NEUTRAL on M4 Pro (+1.1%, within noise). 128KB remains optimal.
 
 ### Tested and rejected in iter20 (DO NOT RETRY)
-- **Raw socket API for counting IPC:** +23% REGRESSION. stream_get_contents() is a single optimized C call; socket_read() loop adds PHP opcode overhead.
-- **Pre-opened temp file FDs:** +12% REGRESSION. FD table duplication overhead, unused FDs.
-- **pcntl_setpriority(-20):** Fails with EPERM, adds syscall overhead. Part of combined D regression.
-- **declare(strict_types=1):** May slow type checking paths. Part of combined D regression.
-- **set_error_handler(null) per worker:** 18 extra function calls. Part of combined D regression.
-- **Skip ksort with dateJsonPrefix iteration:** +4% REGRESSION. C-level qsort on int keys beats 2557 isset checks.
+- **Raw socket API for counting IPC:** +23% REGRESSION.
+- **Pre-opened temp file FDs:** +12% REGRESSION.
+- **pcntl_setpriority(-20):** Fails with EPERM, adds syscall overhead.
+- **declare(strict_types=1):** May slow type checking paths.
+- **set_error_handler(null) per worker:** 18 extra function calls.
+- **Skip ksort with dateJsonPrefix iteration:** +4% REGRESSION.
 - **256KB read chunks on M4 Pro:** NEUTRAL. 128KB remains optimal.
-- **pack('v') for dateToId:** DONE (applied). Neutral perf but cleaner.
-- **Year range 2020-2026:** DONE (applied). Correctness fix, neutral perf.
-- **M1-adaptive tuning:** DONE (applied). Neutral on M4 Pro, targets M1.
 
 ### Exhausted categories (DO NOT RETRY):
 - **Hot loop micro-optimizations:** AT INTERPRETER FLOOR. ~120ns/row. No further optimization possible with pure PHP.
@@ -276,9 +280,9 @@ This measures: PHP startup (~15ms) + bypass (<1ms) + Parser::parse(). Framework 
 - **IPC format for parsing:** Temp files + TLV + coordinator is optimal.
 - **IPC for counting workers:** Sockets with stream_get_contents are optimal. Raw socket API is +23% (iter20). Temp files are +1.5% (iter18).
 - **Chunk boundary handling:** $leftover string is optimal. fseek backward is +1.5% (iter18).
-- **Worker count:** 10 on M4 Pro, 12 on M1 is optimal.
-- **Read chunk size:** 128KB on M4 Pro, 160KB on M1. 256KB neutral (iter20).
-- **Setup phase:** All micro-opts done. pack('v') applied.
+- **Worker count:** 10 workers (fixed). Adaptive detection removed iter21.
+- **Read chunk size:** 128KB (fixed). 160KB neutral (iter21). 256KB neutral (iter20).
+- **Setup phase:** All micro-opts done. pack('v') applied. error_reporting(0) NEUTRAL (iter21).
 - **Architecture:** Bucket accumulation + C-level string merge is locally optimal for PHP.
 - **Worker-side counting:** Extends critical path. +12-20% regression.
 - **Single-phase counting:** +1.6% regression on M4 Pro (iter19).
@@ -289,6 +293,8 @@ This measures: PHP startup (~15ms) + bypass (<1ms) + Parser::parse(). Framework 
 - **Pre-opened FDs:** +12% regression (iter20).
 - **Raw socket API:** +23% regression (iter20).
 - **pcntl_setpriority:** Fails without root, adds overhead (iter20).
+- **stream_set_chunk_size:** NEUTRAL (iter21). No benefit from matching PHP internal chunk size to fread.
+- **Counting fwrite 524KB:** NEUTRAL (iter21). Larger write chunks don't reduce wall time.
 - **All leaderboard PRs studied:** xHeaven #3, johnwedgbury #116, dannyvankooten #65, gere-lajos #16, alexandre-daubois #46.
 
 ## Performance Timeline
@@ -316,6 +322,7 @@ This measures: PHP startup (~15ms) + bypass (<1ms) + Parser::parse(). Framework 
 | **18 (100M)** | **~1609** | **~2000** | **fseek-backward +1.5%, temp file counting +1.5% — BOTH regressed** | **0%** |
 | **19 (100M)** | **~1609** | **~2000** | **Integer-indexed buckets -0.7% (noise), single-phase +1.6% (regression)** | **0%** |
 | **20 (100M)** | **~1200** | **~1200** | **Year 2020-2026 (correctness), pack('v'), M1-adaptive tuning. Raw sockets +23%, pre-opened FDs +12%, combined micro +10%, skip ksort +4%, 256KB neutral. Wall-clock measured with fast-path bypass (no framework overhead).** | **0%** |
+| **21 (100M)** | **~1190** | **~1190** | **User-directed: year 2021-2026, remove sysctl adaptive detection, fixed 10 workers/128KB. error_reporting(0) NEUTRAL, stream_set_chunk_size NEUTRAL, 160KB chunks NEUTRAL, fwrite 524K NEUTRAL.** | **0%** |
 
 ## Environment
 - PHP 8.5.2 (NTS clang 15.0.0)
@@ -341,16 +348,15 @@ This measures: PHP startup (~15ms) + bypass (<1ms) + Parser::parse(). Framework 
 - **IMPORTANT: PHP explicit references (&$array) are SLOWER than COW for read-only access.** IS_REFERENCE wrapper adds per-access dereferencing overhead. Only use references when the function MODIFIES the array.
 - **IMPORTANT: do-while optimization only matters in HOT loops (>100K iterations).** Non-hot loops (setup, fork, counting worker foreach ~99K) save <200μs — far below 2% threshold. The iter16 do-while improvement came from the 6x unrolled parse loop processing millions of lines.
 
-## Status Assessment (post-iter20, 100M scale)
+## Status Assessment (post-iter21, 100M scale)
 
-**Status: NEAR COMPLETE.** Major architectural AND micro-optimizations are exhausted. Only 5 untested micro-experiments remain (error_reporting(0) alone, stream_set_chunk_size, non-blocking counting reads, new PR research, counting fwrite chunk size). Expected individual impact: <1% each.
+**Status: EFFECTIVELY COMPLETE.** All architectural, parallelism, IPC, and micro-optimizations are exhausted. Only 2 untested ideas remain: (1) non-blocking counting reads with output overlap (complex, expected ~5-10ms), (2) new leaderboard PR research. All other categories are provably exhausted.
 
-**Iter20 tested 7 experiments, applied 3 (correctness/M1 tuning), 4 were regressions:**
-- Applied: year range 2020-2026 (correctness), pack('v') (cleanup), M1-adaptive tuning (competition)
-- Regressions: raw socket API (+23%), pre-opened FDs (+12%), combined micro-opts (+10%), skip ksort (+4%)
-- Neutral: 256KB chunks
+**Iter21 tested 4 experiments, applied 1 (user directive), 3 were neutral:**
+- Applied: year range 2021-2026 + remove sysctl detection (user directive, performance neutral)
+- Neutral: error_reporting(0), stream_set_chunk_size + fwrite 524K, 160KB chunks
 
-**7 consecutive iterations (14-20) with no measurable performance improvement on M4 Pro.** The parser is at the PHP interpreter floor for the hot loop (~120ns/row). All major leaderboard techniques have been studied and either applied or proven inferior to our architecture on M4 Pro.
+**8 consecutive iterations (14-21) with no measurable performance improvement on M4 Pro.** The parser is at the PHP interpreter floor for the hot loop (~120ns/row). All major leaderboard techniques have been studied and either applied or proven inferior to our architecture on M4 Pro.
 
 **NOTE: `tempest` entry point has a fast-path bypass.** Benchmark with explicit paths:
 ```bash
