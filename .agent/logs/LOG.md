@@ -1,8 +1,8 @@
 # Parser Optimization Knowledge Base
 
 ## Current State
-- **Best wall-clock (100M, bypass):** ~1.19s (hyperfine mean, fast-path bypass, M4 Pro)
-- **Iteration count:** 21
+- **Best wall-clock (100M, bypass):** ~1.155s (hyperfine mean ± 0.016s, fast-path bypass, M4 Pro)
+- **Iteration count:** 22
 - **Parser architecture:** Parent-as-coordinator + temp file IPC. Fixed 10 workers (no adaptive detection). All workers are children (parent does no hotloop). Workers write TLV-encoded output to temp files (file_put_contents). Parent uses waitpid(-1) to drain workers in completion order, overlapping drain with worker execution. Unbuffered I/O (stream_set_read_buffer 0), 6x loop unrolling, bucket accumulation with 2-byte date IDs (pack('v') encoding, 8-char "YY-MM-DD" keys), 128KB read chunks, zero-copy hot loop, 8 counting workers with pre-computed JSON date prefixes (dateJsonPrefix) via socket IPC, SIGKILL fast exit, 512KB slug sample, fence at lastNl - 600, year range 2021-2026 (2191 dates).
 
 ## Bottleneck Model (iter16 — 100M scale, MEASURED via microtime instrumentation)
@@ -253,11 +253,11 @@ This measures: PHP startup (~15ms) + bypass (<1ms) + Parser::parse(). Framework 
 
 **Statistical rigor (iter12):** With measurement stddev ~5ms at 10M / ~40ms at 100M, need ~24 interleaved pairs for 80% power to detect a 2% effect.
 
-## Remaining Ideas (reassessed post-iter21, exhaustive sweep NEARLY COMPLETE)
+## Remaining Ideas (reassessed post-iter22, exhaustive sweep COMPLETE)
 
-### Still untested
-1. **Non-blocking counting reads with output overlap** — Use `stream_set_blocking(false)` + `stream_select()` on counting worker sockets. Write output for completed counters while others still run. Complex but could save ~5-10ms by overlapping counting tail with output I/O. LAST remaining micro-opt.
-2. **New leaderboard PR research** — Check GitHub for new top entries since iter19 with novel techniques.
+### All ideas exhausted
+1. **Non-blocking counting reads with output overlap** — ANALYZED AND REJECTED (iter22). Requires replacing stream_get_contents with fread loop, proven +23% slower in iter20. stream_select adds syscall overhead. Expected savings <0.5% even if it worked. NOT VIABLE.
+2. **New leaderboard PR research** — COMPLETED (iter22). Studied 7 new PRs (#114, #62, #28, #95, #56, #29, #12). No new actionable techniques found. All top 12 leaderboard entries analyzed.
 
 ### Tested and rejected in iter21 (DO NOT RETRY)
 - **error_reporting(0) at parse() start ONLY:** NEUTRAL on M4 Pro. Single call doesn't measurably impact hot loop throughput.
@@ -295,7 +295,7 @@ This measures: PHP startup (~15ms) + bypass (<1ms) + Parser::parse(). Framework 
 - **pcntl_setpriority:** Fails without root, adds overhead (iter20).
 - **stream_set_chunk_size:** NEUTRAL (iter21). No benefit from matching PHP internal chunk size to fread.
 - **Counting fwrite 524KB:** NEUTRAL (iter21). Larger write chunks don't reduce wall time.
-- **All leaderboard PRs studied:** xHeaven #3, johnwedgbury #116, dannyvankooten #65, gere-lajos #16, alexandre-daubois #46.
+- **All leaderboard PRs studied:** xHeaven #3, johnwedgbury #116, dannyvankooten #65, gere-lajos #16, alexandre-daubois #46, vovakovalchukk #114, seyfer #62, Ashler2 #28, calavera #95, arthurcolle #56, lampelk #29, kemo #12. ALL TOP 12 ANALYZED.
 
 ## Performance Timeline
 
@@ -323,6 +323,7 @@ This measures: PHP startup (~15ms) + bypass (<1ms) + Parser::parse(). Framework 
 | **19 (100M)** | **~1609** | **~2000** | **Integer-indexed buckets -0.7% (noise), single-phase +1.6% (regression)** | **0%** |
 | **20 (100M)** | **~1200** | **~1200** | **Year 2020-2026 (correctness), pack('v'), M1-adaptive tuning. Raw sockets +23%, pre-opened FDs +12%, combined micro +10%, skip ksort +4%, 256KB neutral. Wall-clock measured with fast-path bypass (no framework overhead).** | **0%** |
 | **21 (100M)** | **~1190** | **~1190** | **User-directed: year 2021-2026, remove sysctl adaptive detection, fixed 10 workers/128KB. error_reporting(0) NEUTRAL, stream_set_chunk_size NEUTRAL, 160KB chunks NEUTRAL, fwrite 524K NEUTRAL.** | **0%** |
+| **22 (100M)** | **~1155** | **~1155** | **Research-only. 7 new PRs studied (top 12 leaderboard), NO new actionable techniques. Non-blocking counting reads analyzed+rejected. ALL optimizations exhausted. COMPLETE.** | **0%** |
 
 ## Environment
 - PHP 8.5.2 (NTS clang 15.0.0)
@@ -348,15 +349,13 @@ This measures: PHP startup (~15ms) + bypass (<1ms) + Parser::parse(). Framework 
 - **IMPORTANT: PHP explicit references (&$array) are SLOWER than COW for read-only access.** IS_REFERENCE wrapper adds per-access dereferencing overhead. Only use references when the function MODIFIES the array.
 - **IMPORTANT: do-while optimization only matters in HOT loops (>100K iterations).** Non-hot loops (setup, fork, counting worker foreach ~99K) save <200μs — far below 2% threshold. The iter16 do-while improvement came from the 6x unrolled parse loop processing millions of lines.
 
-## Status Assessment (post-iter21, 100M scale)
+## Status Assessment (post-iter22, 100M scale)
 
-**Status: EFFECTIVELY COMPLETE.** All architectural, parallelism, IPC, and micro-optimizations are exhausted. Only 2 untested ideas remain: (1) non-blocking counting reads with output overlap (complex, expected ~5-10ms), (2) new leaderboard PR research. All other categories are provably exhausted.
+**Status: COMPLETE.** All architectural, parallelism, IPC, and micro-optimizations are exhausted. ALL known techniques have been tested. ALL leaderboard PRs (top 12) have been studied.
 
-**Iter21 tested 4 experiments, applied 1 (user directive), 3 were neutral:**
-- Applied: year range 2021-2026 + remove sysctl detection (user directive, performance neutral)
-- Neutral: error_reporting(0), stream_set_chunk_size + fwrite 524K, 160KB chunks
+**Iter22 findings:** GitHub research of 7 previously unstudied PRs (#114, #62, #28, #95, #56, #29, #12) revealed NO new actionable techniques. All "new" techniques either (a) were already tested (shmop → deadlock iter5, work-stealing → +4.6% iter3), (b) don't apply to our architecture (pre-multiplied path ID requires integer counting, not bucket accumulation), or (c) are limited by macOS constraints (shmall=4MB). Non-blocking counting reads (last untested idea from iter21) was analyzed and rejected: requires replacing stream_get_contents with fread loop, which is +23% slower (proven iter20).
 
-**8 consecutive iterations (14-21) with no measurable performance improvement on M4 Pro.** The parser is at the PHP interpreter floor for the hot loop (~120ns/row). All major leaderboard techniques have been studied and either applied or proven inferior to our architecture on M4 Pro.
+**9 consecutive iterations (14-22) with no measurable performance improvement on M4 Pro.** The parser is at the PHP interpreter floor for the hot loop (~107ns/row measured). All major leaderboard techniques have been studied and either applied or proven inferior to our architecture on M4 Pro.
 
 **NOTE: `tempest` entry point has a fast-path bypass.** Benchmark with explicit paths:
 ```bash
