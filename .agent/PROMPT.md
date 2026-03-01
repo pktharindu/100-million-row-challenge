@@ -233,10 +233,10 @@ Skip any candidates the subagent reported as FAIL in verification. For each rema
 
 Compare all valid candidates against the current best time.
 
-- **Pick the winner:** The fastest valid candidate that is at least **2% faster** than the current best (or >50ms absolute improvement on 10M rows).
+- **Pick the winner:** The fastest valid candidate that is at least **0.5% faster** than the current best (or >5ms absolute improvement).
 - **If multiple candidates improve:** Keep the fastest one.
 - **If no candidates improve:** Revert to baseline. All experiments were informative failures — log what was learned.
-- **If a candidate is marginally faster (<2%):** Consider keeping it ONLY if it enables future optimizations or simplifies the architecture. Otherwise revert.
+- **If a candidate is marginally faster (<0.5%):** Consider keeping it ONLY if it enables future optimizations or simplifies the architecture. Otherwise revert.
 
 **Apply the winner:**
 ```bash

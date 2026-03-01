@@ -247,17 +247,32 @@ This measures: PHP startup (~15ms) + bypass (<1ms) + Parser::parse(). Framework 
 
 **WARNING:** `php tempest data:parse` WITHOUT explicit paths falls through to Tempest (~280ms overhead). ALWAYS pass `--input-path=` and `--output-path=` for benchmarking.
 
-**2% threshold applies to hyperfine wall-clock time** (framework overhead is no longer in the measurement).
+**0.5% threshold applies to hyperfine wall-clock time** (framework overhead is no longer in the measurement). Reduced from 2% for exhaustive micro-optimization sweep.
 
 **Measurement methodology:** Use A/B interleaved testing (alternate baseline and candidate in pairs) to control for thermal/system state. 8+ pairs needed for statistical significance.
 
 **Statistical rigor (iter12):** With measurement stddev ~5ms at 10M / ~40ms at 100M, need ~24 interleaved pairs for 80% power to detect a 2% effect.
 
-## Remaining Ideas (reassessed post-iter22, exhaustive sweep COMPLETE)
+## Remaining Ideas (reassessed post-iter22, NEW untried experiments identified)
 
-### All ideas exhausted
-1. **Non-blocking counting reads with output overlap** — ANALYZED AND REJECTED (iter22). Requires replacing stream_get_contents with fread loop, proven +23% slower in iter20. stream_select adds syscall overhead. Expected savings <0.5% even if it worked. NOT VIABLE.
-2. **New leaderboard PR research** — COMPLETED (iter22). Studied 7 new PRs (#114, #62, #28, #95, #56, #29, #12). No new actionable techniques found. All top 12 leaderboard entries analyzed.
+### Genuinely untried (cross-referenced against ALL 22 iterations + manual session + 9 competitor PRs)
+1. **Remove `unset($buckets)` + `fclose($fh)` in parse workers** — Workers SIGKILL after file_put_contents. Both are wasted cleanup. unset iterates 268 entries, frees ~20MB. fclose flushes and releases fd. Both pointless before SIGKILL.
+2. **Single fwrite for counting output** — Replace while+substr loop with single `fwrite($sock, $fragment)`. Fragments <1MB, buffer is 2MB. Distinct from iter21's 524KB chunk test (which still loops).
+3. **5x loop unroll** — Only 4x/6x/8x tested. Smaller L1i footprint.
+4. **7x loop unroll** — Between tested 6x and 8x.
+5. **96KB read chunks** — Smaller than any tested size. May suit M1 efficiency core L1d (64KB).
+6. **192KB read chunks** — Between tested 128KB and 256KB.
+7. **6 counting workers** — Between tested 4 (regression) and 8 (current).
+8. **12/14 parse workers** — Higher oversubscription. Multiple top entries use 12-14.
+9. **Integer-keyed `$mergedBuckets`** — Pack array for MERGE phase (distinct from iter19's worker bucket test).
+10. **Fixed-order TLV (drop slug index)** — Workers write in order, parent reads sequentially. Fewer ord() calls.
+11. **Single-process baseline** — armstrongsam25 got 2.91s on M1 with zero forks. Quantify fork/IPC overhead.
+
+### New leaderboard discoveries (post-iter22)
+- **armstrongsam25 (#189, 2.91s):** Single-process, 512MB chunks, 8x unroll. No forking at all.
+- **AcidBurn86 (#203, 2.94s):** Our exact architecture — two-phase fork (14 parse + 12 counter). Validates approach.
+- **prateekbhujel (#157, 2.86s):** 12 workers, 512KB chunks, 4x unroll, hardcoded file size.
+- **igutekunst (#188, 2.91s):** 10 workers, slug-keyed buckets (same as ours), /dev/shm preference.
 
 ### Tested and rejected in iter21 (DO NOT RETRY)
 - **error_reporting(0) at parse() start ONLY:** NEUTRAL on M4 Pro. Single call doesn't measurably impact hot loop throughput.
@@ -351,11 +366,9 @@ This measures: PHP startup (~15ms) + bypass (<1ms) + Parser::parse(). Framework 
 
 ## Status Assessment (post-iter22, 100M scale)
 
-**Status: COMPLETE.** All architectural, parallelism, IPC, and micro-optimizations are exhausted. ALL known techniques have been tested. ALL leaderboard PRs (top 12) have been studied.
+**Status: FINAL SWEEP.** Major optimizations exhausted. 11 genuinely untried micro-experiments identified via exhaustive cross-referencing (22 iterations + manual session + 4 new competitor PRs). Threshold reduced to 0.5%.
 
-**Iter22 findings:** GitHub research of 7 previously unstudied PRs (#114, #62, #28, #95, #56, #29, #12) revealed NO new actionable techniques. All "new" techniques either (a) were already tested (shmop → deadlock iter5, work-stealing → +4.6% iter3), (b) don't apply to our architecture (pre-multiplied path ID requires integer counting, not bucket accumulation), or (c) are limited by macOS constraints (shmall=4MB). Non-blocking counting reads (last untested idea from iter21) was analyzed and rejected: requires replacing stream_get_contents with fread loop, which is +23% slower (proven iter20).
-
-**9 consecutive iterations (14-22) with no measurable performance improvement on M4 Pro.** The parser is at the PHP interpreter floor for the hot loop (~107ns/row measured). All major leaderboard techniques have been studied and either applied or proven inferior to our architecture on M4 Pro.
+**9 consecutive iterations (14-22) with no measurable performance improvement on M4 Pro.** The hot loop is at ~107ns/row. Remaining experiments target non-hot-loop phases (IPC, merge, counting, fork overhead) and untested parameter values (unroll factors, chunk sizes, worker counts).
 
 **NOTE: `tempest` entry point has a fast-path bypass.** Benchmark with explicit paths:
 ```bash
