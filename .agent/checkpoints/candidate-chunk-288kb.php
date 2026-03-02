@@ -9,7 +9,7 @@ final class Parser
     public static function parse(string $inputPath, string $outputPath): void
     {
         $numWorkers = 14;
-        $chunkSize = 262144;
+        $chunkSize = 294912;
         $numCounters = 8;
 
         $slugToIdx = [];
@@ -98,10 +98,18 @@ final class Parser
                     }
 
                     $i = 25;
-                    $fence = $lastNl - 750;
+                    $fence = $lastNl - 1000;
 
                     if ($i < $fence) {
                         do {
+                            $c = \strpos($raw, ',', $i);
+                            $buckets[\substr($raw, $i, $c - $i)] .= $dateToId[\substr($raw, $c + 3, 8)];
+                            $i = $c + 52;
+
+                            $c = \strpos($raw, ',', $i);
+                            $buckets[\substr($raw, $i, $c - $i)] .= $dateToId[\substr($raw, $c + 3, 8)];
+                            $i = $c + 52;
+
                             $c = \strpos($raw, ',', $i);
                             $buckets[\substr($raw, $i, $c - $i)] .= $dateToId[\substr($raw, $c + 3, 8)];
                             $i = $c + 52;

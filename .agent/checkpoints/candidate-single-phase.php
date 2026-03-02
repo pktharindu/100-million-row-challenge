@@ -10,8 +10,8 @@ final class Parser
     {
         $numWorkers = 14;
         $chunkSize = 262144;
-        $numCounters = 8;
 
+        // ── Slug discovery (identical to original) ──────────────────────
         $slugToIdx = [];
         $slugCount = 0;
         $fh = \fopen($inputPath, 'rb');
@@ -32,6 +32,7 @@ final class Parser
         $slugOrderList = \array_keys($slugToIdx);
         unset($sample);
 
+        // ── Date ID table (identical to original) ───────────────────────
         $dateToId = [];
         $idToDate = [];
         $dateId = 0;
@@ -51,11 +52,14 @@ final class Parser
             }
         }
 
+        $dateCount = $dateId; // total date IDs (2191 for 2021-2026)
+
         $dateJsonPrefix = [];
         foreach ($idToDate as $dId => $dateStr) {
             $dateJsonPrefix[$dId] = '        "' . $dateStr . '": ';
         }
 
+        // ── Chunk boundaries (identical to original) ────────────────────
         $fileSize = \filesize($inputPath);
         $boundaries = [0];
         $fh = \fopen($inputPath, 'rb');
@@ -67,12 +71,14 @@ final class Parser
         $boundaries[] = $fileSize;
         \fclose($fh);
 
+        // ── Fork workers ────────────────────────────────────────────────
         $tmpDir = \sys_get_temp_dir();
         $pidToWorker = [];
 
         for ($w = 0; $w < $numWorkers; $w++) {
             $pid = \pcntl_fork();
             if ($pid === 0) {
+                // ── Phase: Parse (identical hot loop) ───────────────────
                 $buckets = \array_fill_keys($slugOrderList, '');
                 $fh = \fopen($inputPath, 'rb');
                 \stream_set_read_buffer($fh, 0);
@@ -98,10 +104,18 @@ final class Parser
                     }
 
                     $i = 25;
-                    $fence = $lastNl - 750;
+                    $fence = $lastNl - 1000;
 
                     if ($i < $fence) {
                         do {
+                            $c = \strpos($raw, ',', $i);
+                            $buckets[\substr($raw, $i, $c - $i)] .= $dateToId[\substr($raw, $c + 3, 8)];
+                            $i = $c + 52;
+
+                            $c = \strpos($raw, ',', $i);
+                            $buckets[\substr($raw, $i, $c - $i)] .= $dateToId[\substr($raw, $c + 3, 8)];
+                            $i = $c + 52;
+
                             $c = \strpos($raw, ',', $i);
                             $buckets[\substr($raw, $i, $c - $i)] .= $dateToId[\substr($raw, $c + 3, 8)];
                             $i = $c + 52;
@@ -138,19 +152,33 @@ final class Parser
                     }
                 } while ($remaining > 0);
 
-                $out = '';
+                \fclose($fh);
+
+                // ── Count phase (done inside same worker) ───────────────
+                // Build a flat integer array: flatCounts[slugIdx * dateCount + dateId] = count
+                $totalSlots = $slugCount * $dateCount;
+                $flatCounts = \array_fill(0, $totalSlots, 0);
+
                 foreach ($buckets as $slug => $packed) {
                     if ($packed === '') continue;
-                    $out .= \pack('vV', $slugToIdx[$slug], \strlen($packed)) . $packed;
+                    $base = $slugToIdx[$slug] * $dateCount;
+                    $counts = \array_count_values(\unpack('v*', $packed));
+                    foreach ($counts as $dId => $cnt) {
+                        $flatCounts[$base + $dId] = $cnt;
+                    }
                 }
+                unset($buckets);
 
-                \file_put_contents($tmpDir . '/parser_w' . $w, $out);
+                // Write packed uint32 array to temp file
+                \file_put_contents($tmpDir . '/parser_w' . $w, \pack('V*', ...$flatCounts));
                 \posix_kill(\posix_getpid(), 9);
             }
             $pidToWorker[$pid] = $w;
         }
 
-        $mergedBuckets = \array_fill_keys($slugOrderList, '');
+        // ── Parent: drain workers and merge counts ──────────────────────
+        $totalSlots = $slugCount * $dateCount;
+        $merged = \array_fill(0, $totalSlots, 0);
         $drained = 0;
 
         do {
@@ -164,106 +192,64 @@ final class Parser
             $data = \file_get_contents($tmpFile);
             \unlink($tmpFile);
 
-            $offset = 0;
-            $dataLen = \strlen($data);
-            while ($offset < $dataLen) {
-                $slugIdx = \ord($data[$offset]) | (\ord($data[$offset + 1]) << 8);
-                $bucketLen = \ord($data[$offset + 2]) | (\ord($data[$offset + 3]) << 8) | (\ord($data[$offset + 4]) << 16) | (\ord($data[$offset + 5]) << 24);
-                $offset += 6;
-                $mergedBuckets[$slugOrderList[$slugIdx]] .= \substr($data, $offset, $bucketLen);
-                $offset += $bucketLen;
-            }
+            // unpack('V*', ...) returns 1-indexed array
+            $wCounts = \unpack('V*', $data);
             unset($data);
+
+            // Element-wise addition (unpack is 1-indexed, merged is 0-indexed)
+            $idx = 0;
+            foreach ($wCounts as $val) {
+                if ($val !== 0) {
+                    $merged[$idx] += $val;
+                }
+                $idx++;
+            }
+            unset($wCounts);
 
             $drained++;
         } while ($drained < $numWorkers);
 
-        $numSlugs = \count($slugOrderList);
-        $slugsPerCounter = (int)\ceil($numSlugs / $numCounters);
-
+        // ── Parent: generate JSON serially ──────────────────────────────
         $slugJsonHeaders = [];
         foreach ($slugOrderList as $slug) {
             $slugJsonHeaders[$slug] = '    "\/blog\/' . $slug . '": {' . "\n";
         }
 
-        $countPipes = [];
-        for ($c = 0; $c < $numCounters; $c++) {
-            \socket_create_pair(AF_UNIX, SOCK_STREAM, 0, $rawPair);
-            \socket_set_option($rawPair[0], SOL_SOCKET, SO_RCVBUF, 65536);
-            \socket_set_option($rawPair[1], SOL_SOCKET, SO_SNDBUF, 65536);
-            $countPipes[$c] = [\socket_export_stream($rawPair[0]), \socket_export_stream($rawPair[1])];
-        }
-
-        $countPids = [];
-        for ($c = 0; $c < $numCounters; $c++) {
-            $pid = \pcntl_fork();
-            if ($pid === 0) {
-                for ($i = 0; $i < $numCounters; $i++) {
-                    \fclose($countPipes[$i][0]);
-                    if ($i !== $c) \fclose($countPipes[$i][1]);
-                }
-
-                $myStart = $c * $slugsPerCounter;
-                $myEnd = \min(($c + 1) * $slugsPerCounter, $numSlugs);
-
-                $slugParts = [];
-
-                for ($s = $myStart; $s < $myEnd; $s++) {
-                    $slug = $slugOrderList[$s];
-                    $packed = $mergedBuckets[$slug];
-                    if ($packed === '') continue;
-
-                    $counts = \array_count_values(\unpack('v*', $packed));
-                    \ksort($counts);
-
-                    $dateParts = [];
-                    foreach ($counts as $dId => $count) {
-                        $dateParts[] = $dateJsonPrefix[$dId] . $count;
-                    }
-                    $slugParts[] = $slugJsonHeaders[$slug] . \implode(",\n", $dateParts) . "\n    }";
-                }
-
-                $fragment = \implode(",\n", $slugParts);
-
-                $sock = $countPipes[$c][1];
-                $len = \strlen($fragment);
-                $written = 0;
-                while ($written < $len) {
-                    $n = \fwrite($sock, \substr($fragment, $written, 524288));
-                    if ($n === false) break;
-                    $written += $n;
-                }
-                \fclose($sock);
-                \posix_kill(\posix_getpid(), 9);
-            }
-            $countPids[] = $pid;
-        }
-
-        for ($c = 0; $c < $numCounters; $c++) {
-            \fclose($countPipes[$c][1]);
-        }
-        unset($mergedBuckets);
-
         $fhOut = \fopen($outputPath, 'wb');
         \fwrite($fhOut, "{\n");
         $needSep = false;
 
-        for ($c = 0; $c < $numCounters; $c++) {
-            $fragment = \stream_get_contents($countPipes[$c][0]);
-            \fclose($countPipes[$c][0]);
+        for ($s = 0; $s < $slugCount; $s++) {
+            $slug = $slugOrderList[$s];
+            $base = $s * $dateCount;
 
-            if ($fragment !== '') {
-                if ($needSep) \fwrite($fhOut, ",\n");
-                \fwrite($fhOut, $fragment);
-                $needSep = true;
+            // Collect non-zero counts for this slug, keyed by dateId
+            $counts = [];
+            for ($d = 0; $d < $dateCount; $d++) {
+                $val = $merged[$base + $d];
+                if ($val !== 0) {
+                    $counts[$d] = $val;
+                }
             }
+
+            if (empty($counts)) continue;
+
+            // ksort by dateId (dateIds are already in chronological order,
+            // and we iterate 0..$dateCount-1, so they are already sorted.
+            // But ksort to match original behavior exactly.)
+            \ksort($counts);
+
+            $dateParts = [];
+            foreach ($counts as $dId => $count) {
+                $dateParts[] = $dateJsonPrefix[$dId] . $count;
+            }
+
+            if ($needSep) \fwrite($fhOut, ",\n");
+            \fwrite($fhOut, $slugJsonHeaders[$slug] . \implode(",\n", $dateParts) . "\n    }");
+            $needSep = true;
         }
 
         \fwrite($fhOut, "\n}");
         \fclose($fhOut);
-
-        foreach ($countPids as $pid) {
-            \pcntl_waitpid($pid, $status);
-        }
     }
 }
