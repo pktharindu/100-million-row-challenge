@@ -15,7 +15,7 @@ final class Parser
         $slugToIdx = [];
         $slugCount = 0;
         $fh = \fopen($inputPath, 'rb');
-        $sample = \fread($fh, 131072);
+        $sample = \fread($fh, 262144);
 
         $sampleLen = \strlen($sample);
         $sPos = 0;
@@ -103,10 +103,14 @@ final class Parser
                     }
 
                     $i = 25;
-                    $fence = $lastNl - 625;
+                    $fence = $lastNl - 750;
 
                     if ($i < $fence) {
                         do {
+                            $c = \strpos($raw, ',', $i);
+                            $buckets[\substr($raw, $i, $c - $i)] .= $dateToId[\substr($raw, $c + 3, 8)];
+                            $i = $c + 52;
+
                             $c = \strpos($raw, ',', $i);
                             $buckets[\substr($raw, $i, $c - $i)] .= $dateToId[\substr($raw, $c + 3, 8)];
                             $i = $c + 52;
@@ -181,6 +185,11 @@ final class Parser
         } while ($drained < $numWorkers);
 
         $numSlugs = \count($slugOrderList);
+
+        $slugJsonHeaders = [];
+        foreach ($slugOrderList as $slug) {
+            $slugJsonHeaders[$slug] = '    "\/blog\/' . $slug . '": {' . "\n";
+        }
         $slugsPerCounter = (int)\ceil($numSlugs / $numCounters);
 
         $countPipes = [];
