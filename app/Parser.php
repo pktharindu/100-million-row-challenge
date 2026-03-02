@@ -8,8 +8,8 @@ final class Parser
 {
     public static function parse(string $inputPath, string $outputPath): void
     {
-        $numWorkers = 10;
-        $chunkSize = 131072;
+        $numWorkers = 14;
+        $chunkSize = 262144;
         $numCounters = 8;
 
         $slugToIdx = [];
@@ -98,10 +98,18 @@ final class Parser
                     }
 
                     $i = 25;
-                    $fence = $lastNl - 600;
+                    $fence = $lastNl - 1000;
 
                     if ($i < $fence) {
                         do {
+                            $c = \strpos($raw, ',', $i);
+                            $buckets[\substr($raw, $i, $c - $i)] .= $dateToId[\substr($raw, $c + 3, 8)];
+                            $i = $c + 52;
+
+                            $c = \strpos($raw, ',', $i);
+                            $buckets[\substr($raw, $i, $c - $i)] .= $dateToId[\substr($raw, $c + 3, 8)];
+                            $i = $c + 52;
+
                             $c = \strpos($raw, ',', $i);
                             $buckets[\substr($raw, $i, $c - $i)] .= $dateToId[\substr($raw, $c + 3, 8)];
                             $i = $c + 52;
@@ -189,8 +197,8 @@ final class Parser
         $countPipes = [];
         for ($c = 0; $c < $numCounters; $c++) {
             \socket_create_pair(AF_UNIX, SOCK_STREAM, 0, $rawPair);
-            \socket_set_option($rawPair[0], SOL_SOCKET, SO_RCVBUF, 2097152);
-            \socket_set_option($rawPair[1], SOL_SOCKET, SO_SNDBUF, 2097152);
+            \socket_set_option($rawPair[0], SOL_SOCKET, SO_RCVBUF, 65536);
+            \socket_set_option($rawPair[1], SOL_SOCKET, SO_SNDBUF, 65536);
             $countPipes[$c] = [\socket_export_stream($rawPair[0]), \socket_export_stream($rawPair[1])];
         }
 
@@ -229,7 +237,7 @@ final class Parser
                 $len = \strlen($fragment);
                 $written = 0;
                 while ($written < $len) {
-                    $n = \fwrite($sock, \substr($fragment, $written, 131072));
+                    $n = \fwrite($sock, \substr($fragment, $written, 524288));
                     if ($n === false) break;
                     $written += $n;
                 }
